@@ -10,26 +10,27 @@ class allocator_global_heap final:
 {
 
 private:
+    std::mutex mutex;
 
     static constexpr const size_t size_t_size = sizeof(size_t);
 
 public:
     
-    explicit allocator_global_heap();
+    explicit allocator_global_heap() = default;
     
-    ~allocator_global_heap() override;
-    
-    allocator_global_heap(
-        allocator_global_heap const &other);
-    
-    allocator_global_heap &operator=(
-        allocator_global_heap const &other);
+    ~allocator_global_heap() override = default;
     
     allocator_global_heap(
-        allocator_global_heap &&other) noexcept;
+        allocator_global_heap const &other) = delete;
     
     allocator_global_heap &operator=(
-        allocator_global_heap &&other) noexcept;
+        allocator_global_heap const &other) = delete;
+    
+    allocator_global_heap(
+        allocator_global_heap &&other) noexcept = delete;
+    
+    allocator_global_heap &operator=(
+        allocator_global_heap &&other) noexcept = delete;
 
 private:
     
