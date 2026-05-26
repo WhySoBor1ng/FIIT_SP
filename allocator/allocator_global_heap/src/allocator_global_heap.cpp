@@ -16,5 +16,10 @@ void allocator_global_heap::do_deallocate_sm(void *at)
 
 bool allocator_global_heap::do_is_equal(const std::pmr::memory_resource &other) const noexcept
 {
-    return this == &other;
+    if (this == &other)
+    {
+        return true;
+    }
+    auto rhs = dynamic_cast<const allocator_global_heap *>(&other);
+    return rhs != nullptr;
 }
