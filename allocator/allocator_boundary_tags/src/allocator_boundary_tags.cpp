@@ -1,396 +1,318 @@
 #include "../include/allocator_boundary_tags.h"
 
-#include <algorithm>
-#include <cstring>
-#include <memory>
+#include "allocator_with_fit_mode.h"
+
+#include <memory_resource>
 #include <new>
-#include <utility>
+#include <stdexcept>
 
-namespace
+auto allocator_boundary_tags::get_parent_alloc() const
 {
-    struct boundary_allocator_meta final
-    {
-        std::pmr::memory_resource* parent_allocator;
-        allocator_with_fit_mode::fit_mode fit_mode;
-        size_t space_size;
-        std::mutex mutex;
-        void* first_occupied;
-        void* last_occupied;
-    };
+    return static_cast<memory_resource**>(_trusted_memory);
+}
 
-    struct occupied_block final
-    {
-        size_t payload_capacity;
-        occupied_block* prev;
-        occupied_block* next;
-        void* reserved;
-    };
+auto allocator_boundary_tags::get_fit_mode() const
+{
+    return reinterpret_cast<fit_mode*>(static_cast<char*>(_trusted_memory) + sizeof(memory_resource*));
+}
 
-    boundary_allocator_meta* get_meta(void* trusted) noexcept
+auto allocator_boundary_tags::get_full_size() const
+{
+    return reinterpret_cast<size_t*>(static_cast<char*>(_trusted_memory) + sizeof(memory_resource*) + sizeof(fit_mode));
+}
+
+auto allocator_boundary_tags::get_mutex() const
+{
+    return reinterpret_cast<std::mutex*>(static_cast<char*>(_trusted_memory) + sizeof(memory_resource*) + sizeof(fit_mode) + sizeof(size_t));
+}
+
+auto allocator_boundary_tags::get_head() const
+{
+    return reinterpret_cast<void**>(static_cast<char*>(_trusted_memory) + sizeof(memory_resource*) + sizeof(fit_mode) + sizeof(size_t) + sizeof(std::mutex));
+}
+
+auto allocator_boundary_tags::get_memory_start() const
+{
+    return static_cast<char*>(_trusted_memory) + allocator_metadata_size;
+}
+
+auto allocator_boundary_tags::get_memory_end() const
+{
+    return static_cast<char*>(_trusted_memory) + *get_full_size();
+}
+
+auto allocator_boundary_tags::get_free_prev_block(void* block)
+{
+    return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(size_t));
+}
+
+auto allocator_boundary_tags::get_free_next_block(void* block)
+{
+    return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(size_t) + sizeof(void*));
+}
+
+auto allocator_boundary_tags::get_prev_block(void* block)
+{
+    return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(size_t) + 2 * sizeof(void*));
+}
+
+auto allocator_boundary_tags::set_prev_block(void* block, void* prev_block)
+{
+    *get_prev_block(block) = prev_block;
+}
+
+auto allocator_boundary_tags::get_size_block_ptr(void* block)
+{
+    return static_cast<size_t*>(block);
+}
+
+auto allocator_boundary_tags::get_size_block(void* block)
+{
+    return *get_size_block_ptr(block) & ~size_t(1);
+}
+
+void allocator_boundary_tags::insert_free_block(void* block) const
+{
+    void* prev = nullptr;
+    void* current = *get_head();
+
+    while (current != nullptr && current < block)
     {
-        return reinterpret_cast<boundary_allocator_meta*>(trusted);
+        prev = current;
+        current = *get_free_next_block(current);
     }
 
-    const boundary_allocator_meta* get_meta(const void* trusted) noexcept
+    *get_free_prev_block(block) = prev;
+    *get_free_next_block(block) = current;
+
+    if (prev == nullptr)
     {
-        return reinterpret_cast<const boundary_allocator_meta*>(trusted);
+        *get_head() = block;
+    }
+    else
+    {
+        *get_free_next_block(prev) = block;
     }
 
-    unsigned char* region_begin(void* trusted) noexcept
+    if (current != nullptr)
     {
-        return reinterpret_cast<unsigned char*>(trusted) + sizeof(boundary_allocator_meta);
+        *get_free_prev_block(current) = block;
+    }
+}
+
+void allocator_boundary_tags::remove_free_block(void* block) const
+{
+    void* prev = *get_free_prev_block(block);
+    void* next = *get_free_next_block(block);
+
+    if (prev == nullptr)
+    {
+        *get_head() = next;
+    }
+    else
+    {
+        *get_free_next_block(prev) = next;
     }
 
-    const unsigned char* region_begin(const void* trusted) noexcept
+    if (next != nullptr)
     {
-        return reinterpret_cast<const unsigned char*>(trusted) + sizeof(boundary_allocator_meta);
+        *get_free_prev_block(next) = prev;
     }
+}
 
-    unsigned char* region_end(void* trusted) noexcept
+allocator_boundary_tags::block_choice allocator_boundary_tags::find_block(size_t needed) const
+{
+    block_choice choice{nullptr, 0};
+
+    for (void* block = *get_head(); block != nullptr; block = *get_free_next_block(block))
     {
-        return region_begin(trusted) + get_meta(trusted)->space_size;
-    }
-
-    const unsigned char* region_end(const void* trusted) noexcept
-    {
-        return region_begin(trusted) + get_meta(trusted)->space_size;
-    }
-
-    occupied_block* first_block(void* trusted) noexcept
-    {
-        return reinterpret_cast<occupied_block*>(get_meta(trusted)->first_occupied);
-    }
-
-    const occupied_block* first_block(const void* trusted) noexcept
-    {
-        return reinterpret_cast<const occupied_block*>(get_meta(trusted)->first_occupied);
-    }
-
-    occupied_block* next_physical_block(occupied_block* block) noexcept
-    {
-        return block == nullptr ? nullptr : block->next;
-    }
-
-    const occupied_block* next_physical_block(const occupied_block* block) noexcept
-    {
-        return block == nullptr ? nullptr : block->next;
-    }
-
-    unsigned char* block_end(occupied_block* block) noexcept
-    {
-        return reinterpret_cast<unsigned char*>(block)
-               + sizeof(occupied_block)
-               + block->payload_capacity;
-    }
-
-    const unsigned char* block_end(const occupied_block* block) noexcept
-    {
-        return reinterpret_cast<const unsigned char*>(block)
-               + sizeof(occupied_block)
-               + block->payload_capacity;
-    }
-
-    void* clone_state(const void* source_trusted)
-    {
-        const auto* source_meta = get_meta(source_trusted);
-        auto* parent_allocator = source_meta->parent_allocator == nullptr
-            ? std::pmr::get_default_resource()
-            : source_meta->parent_allocator;
-
-        const auto total_size = sizeof(boundary_allocator_meta) + source_meta->space_size;
-        void* new_memory = parent_allocator->allocate(total_size, alignof(std::max_align_t));
-        std::memcpy(new_memory, source_trusted, total_size);
-
-        auto* new_meta = get_meta(new_memory);
-        new (&new_meta->mutex) std::mutex();
-        new_meta->parent_allocator = parent_allocator;
-
-        const auto offset = reinterpret_cast<unsigned char*>(new_memory)
-                            - reinterpret_cast<const unsigned char*>(source_trusted);
-
-        if (new_meta->first_occupied != nullptr)
+        size_t block_size = get_size_block(block);
+        if (block_size < needed)
         {
-            new_meta->first_occupied = reinterpret_cast<unsigned char*>(new_meta->first_occupied) + offset;
-        }
-        if (new_meta->last_occupied != nullptr)
-        {
-            new_meta->last_occupied = reinterpret_cast<unsigned char*>(new_meta->last_occupied) + offset;
+            continue;
         }
 
-        auto* current = reinterpret_cast<occupied_block*>(new_meta->first_occupied);
-        while (current != nullptr)
+        if (*get_fit_mode() == fit_mode::first_fit)
         {
-            if (current->prev != nullptr)
-            {
-                current->prev = reinterpret_cast<occupied_block*>(reinterpret_cast<unsigned char*>(current->prev) + offset);
-            }
-            if (current->next != nullptr)
-            {
-                current->next = reinterpret_cast<occupied_block*>(reinterpret_cast<unsigned char*>(current->next) + offset);
-            }
-            current = current->next;
+            return {block, block_size};
         }
 
-        return new_memory;
+        if (choice.block == nullptr)
+        {
+            choice = {block, block_size};
+            continue;
+        }
+
+        if (*get_fit_mode() == fit_mode::the_best_fit && block_size < choice.size)
+        {
+            choice = {block, block_size};
+        }
+
+        if (*get_fit_mode() == fit_mode::the_worst_fit && block_size > choice.size)
+        {
+            choice = {block, block_size};
+        }
     }
+
+    return choice;
+}
+
+bool allocator_boundary_tags::is_block_free(void* block)
+{
+    return (*get_size_block_ptr(block) & size_t(1)) == 0;
 }
 
 allocator_boundary_tags::~allocator_boundary_tags()
 {
-    if (_trusted_memory == nullptr)
-    {
-        return;
-    }
-
-    auto* meta = get_meta(_trusted_memory);
-    auto* parent_allocator = meta->parent_allocator == nullptr
-        ? std::pmr::get_default_resource()
-        : meta->parent_allocator;
-    const auto total_size = sizeof(boundary_allocator_meta) + meta->space_size;
-
-    meta->mutex.~mutex();
-    parent_allocator->deallocate(_trusted_memory, total_size, alignof(std::max_align_t));
-    _trusted_memory = nullptr;
-}
-
-allocator_boundary_tags::allocator_boundary_tags(
-    allocator_boundary_tags&& other) noexcept :
-    _trusted_memory(other._trusted_memory)
-{
-    other._trusted_memory = nullptr;
-}
-
-allocator_boundary_tags& allocator_boundary_tags::operator=(
-    allocator_boundary_tags&& other) noexcept
-{
-    if (this == &other)
-    {
-        return *this;
-    }
-
-    this->~allocator_boundary_tags();
-    _trusted_memory = other._trusted_memory;
-    other._trusted_memory = nullptr;
-    return *this;
+    get_mutex()->~mutex();
+    (*get_parent_alloc())->deallocate(_trusted_memory, *get_full_size());
 }
 
 allocator_boundary_tags::allocator_boundary_tags(
     size_t space_size,
     std::pmr::memory_resource* parent_allocator,
-    allocator_with_fit_mode::fit_mode allocate_fit_mode) :
-    _trusted_memory(nullptr)
+    allocator_with_fit_mode::fit_mode allocate_fit_mode)
 {
-    auto* real_parent_allocator = parent_allocator == nullptr
-        ? std::pmr::get_default_resource()
-        : parent_allocator;
-
-    const auto total_size = sizeof(boundary_allocator_meta) + space_size;
-    _trusted_memory = real_parent_allocator->allocate(total_size, alignof(std::max_align_t));
-
-    new (_trusted_memory) boundary_allocator_meta{
-        real_parent_allocator,
-        allocate_fit_mode,
-        space_size,
-        std::mutex{},
-        nullptr,
-        nullptr
-    };
-}
-
-[[nodiscard]] void* allocator_boundary_tags::do_allocate_sm(
-    size_t size)
-{
-    std::lock_guard lock(get_meta(_trusted_memory)->mutex);
-
-    auto* meta = get_meta(_trusted_memory);
-    occupied_block* best_prev = nullptr;
-    occupied_block* best_next = nullptr;
-    unsigned char* best_start = nullptr;
-    size_t best_gap = 0;
-
-    occupied_block* prev = nullptr;
-    auto* current = first_block(_trusted_memory);
-    auto* gap_start = region_begin(_trusted_memory);
-
-    const auto required = sizeof(occupied_block) + size;
-
-    while (true)
-    {
-        const auto* gap_end = current == nullptr
-            ? region_end(_trusted_memory)
-            : reinterpret_cast<unsigned char*>(current);
-        const auto gap_size = static_cast<size_t>(gap_end - gap_start);
-
-        if (gap_size >= required)
-        {
-            if (meta->fit_mode == fit_mode::first_fit)
-            {
-                best_prev = prev;
-                best_next = current;
-                best_start = gap_start;
-                best_gap = gap_size;
-                break;
-            }
-
-            if (best_start == nullptr
-                || (meta->fit_mode == fit_mode::the_best_fit && gap_size < best_gap)
-                || (meta->fit_mode == fit_mode::the_worst_fit && gap_size > best_gap))
-            {
-                best_prev = prev;
-                best_next = current;
-                best_start = gap_start;
-                best_gap = gap_size;
-            }
-        }
-
-        if (current == nullptr)
-        {
-            break;
-        }
-
-        gap_start = block_end(current);
-        prev = current;
-        current = current->next;
-    }
-
-    if (best_start == nullptr)
+    if (space_size < occupied_block_metadata_size)
     {
         throw std::bad_alloc();
     }
 
-    size_t payload_capacity = size;
-    if (best_gap != 0 && best_gap - required < sizeof(occupied_block))
-    {
-        payload_capacity = best_gap - sizeof(occupied_block);
-    }
+    parent_allocator = parent_allocator != nullptr
+        ? parent_allocator
+        : std::pmr::get_default_resource();
 
-    auto* block = new (best_start) occupied_block{payload_capacity, best_prev, best_next, nullptr};
+    size_t total_size = allocator_metadata_size + space_size;
+    _trusted_memory = parent_allocator->allocate(total_size);
 
-    if (best_prev == nullptr)
-    {
-        meta->first_occupied = block;
-    }
-    else
-    {
-        best_prev->next = block;
-    }
+    *get_parent_alloc() = parent_allocator;
+    *get_fit_mode() = allocate_fit_mode;
+    *get_full_size() = total_size;
+    new (get_mutex()) std::mutex();
 
-    if (best_next == nullptr)
-    {
-        meta->last_occupied = block;
-    }
-    else
-    {
-        best_next->prev = block;
-    }
-
-    return reinterpret_cast<unsigned char*>(block) + sizeof(occupied_block);
+    void* first_block = get_memory_start();
+    *get_head() = first_block;
+    *get_free_prev_block(first_block) = nullptr;
+    *get_free_next_block(first_block) = nullptr;
+    *get_prev_block(first_block) = nullptr;
+    *get_size_block_ptr(first_block) = space_size;
 }
 
-void allocator_boundary_tags::do_deallocate_sm(
-    void* at)
+[[nodiscard]] void* allocator_boundary_tags::do_allocate_sm(size_t size)
 {
+    std::lock_guard lock(*get_mutex());
+
+    size_t needed = size + occupied_block_metadata_size;
+    block_choice choice = find_block(needed);
+    if (choice.block == nullptr)
+    {
+        throw std::bad_alloc();
+    }
+
+    void* prev_block = *get_prev_block(choice.block);
+    remove_free_block(choice.block);
+
+    size_t remainder = choice.size - needed;
+    if (remainder >= occupied_block_metadata_size)
+    {
+        void* free_block = static_cast<char*>(choice.block) + needed;
+        *get_size_block_ptr(choice.block) = needed | size_t(1);
+        set_prev_block(choice.block, prev_block);
+
+        *get_size_block_ptr(free_block) = remainder;
+        *get_free_prev_block(free_block) = nullptr;
+        *get_free_next_block(free_block) = nullptr;
+        set_prev_block(free_block, choice.block);
+
+        void* next_block = static_cast<char*>(free_block) + remainder;
+        if (next_block < get_memory_end())
+        {
+            set_prev_block(next_block, free_block);
+        }
+
+        insert_free_block(free_block);
+    }
+    else
+    {
+        *get_size_block_ptr(choice.block) = choice.size | size_t(1);
+        set_prev_block(choice.block, prev_block);
+    }
+
+    return static_cast<char*>(choice.block) + occupied_block_metadata_size;
+}
+
+void allocator_boundary_tags::do_deallocate_sm(void* at)
+{
+    std::lock_guard lock(*get_mutex());
+
     if (at == nullptr)
     {
         return;
     }
 
-    auto* meta = get_meta(_trusted_memory);
-    std::lock_guard lock(meta->mutex);
-
-    auto* block = reinterpret_cast<occupied_block*>(
-        reinterpret_cast<unsigned char*>(at) - sizeof(occupied_block));
-
-    if (reinterpret_cast<unsigned char*>(block) < region_begin(_trusted_memory)
-        || reinterpret_cast<unsigned char*>(block) >= region_end(_trusted_memory))
+    if (at < get_memory_start() || at >= get_memory_end())
     {
-        return;
+        throw std::invalid_argument("block bounds are invalid");
     }
 
-    auto* current = first_block(_trusted_memory);
-    while (current != nullptr && current != block)
+    void* block = static_cast<char*>(at) - occupied_block_metadata_size;
+    *get_size_block_ptr(block) = get_size_block(block);
+
+    if (void* prev = *get_prev_block(block); prev != nullptr && is_block_free(prev))
     {
-        current = current->next;
+        remove_free_block(prev);
+        *get_size_block_ptr(prev) = get_size_block(prev) + get_size_block(block);
+        block = prev;
     }
 
-    if (current == nullptr)
+    void* next = static_cast<char*>(block) + get_size_block(block);
+    if (next < get_memory_end() && is_block_free(next))
     {
-        return;
+        remove_free_block(next);
+        *get_size_block_ptr(block) = get_size_block(block) + get_size_block(next);
     }
 
-    if (block->prev == nullptr)
+    next = static_cast<char*>(block) + get_size_block(block);
+    if (next < get_memory_end())
     {
-        meta->first_occupied = block->next;
-    }
-    else
-    {
-        block->prev->next = block->next;
+        set_prev_block(next, block);
     }
 
-    if (block->next == nullptr)
-    {
-        meta->last_occupied = block->prev;
-    }
-    else
-    {
-        block->next->prev = block->prev;
-    }
+    insert_free_block(block);
 }
 
-inline void allocator_boundary_tags::set_fit_mode(
-    allocator_with_fit_mode::fit_mode mode)
+inline void allocator_boundary_tags::set_fit_mode(allocator_with_fit_mode::fit_mode mode)
 {
-    std::lock_guard lock(get_meta(_trusted_memory)->mutex);
-    get_meta(_trusted_memory)->fit_mode = mode;
+    std::lock_guard lock(*get_mutex());
+    *get_fit_mode() = mode;
 }
 
 std::vector<allocator_test_utils::block_info> allocator_boundary_tags::get_blocks_info() const
 {
-    std::lock_guard lock(get_meta(_trusted_memory)->mutex);
+    std::lock_guard lock(*get_mutex());
     return get_blocks_info_inner();
-}
-
-allocator_boundary_tags::boundary_iterator allocator_boundary_tags::begin() const noexcept
-{
-    return boundary_iterator(_trusted_memory);
-}
-
-allocator_boundary_tags::boundary_iterator allocator_boundary_tags::end() const noexcept
-{
-    return boundary_iterator();
 }
 
 std::vector<allocator_test_utils::block_info> allocator_boundary_tags::get_blocks_info_inner() const
 {
-    std::vector<allocator_test_utils::block_info> result;
-    for (auto it = begin(); it != end(); ++it)
+    std::vector<block_info> result;
+
+    for (char* block = get_memory_start(); block < get_memory_end(); block += get_size_block(block))
     {
-        result.push_back({it.size(), it.occupied()});
+        result.push_back({get_size_block(block), !is_block_free(block)});
     }
+
     return result;
 }
 
-allocator_boundary_tags::allocator_boundary_tags(const allocator_boundary_tags& other) :
-    _trusted_memory(nullptr)
+allocator_boundary_tags::boundary_iterator allocator_boundary_tags::begin() const noexcept
 {
-    std::lock_guard lock(get_meta(other._trusted_memory)->mutex);
-    _trusted_memory = clone_state(other._trusted_memory);
+    return {const_cast<allocator_boundary_tags*>(this)};
 }
 
-allocator_boundary_tags& allocator_boundary_tags::operator=(const allocator_boundary_tags& other)
+allocator_boundary_tags::boundary_iterator allocator_boundary_tags::end() noexcept
 {
-    if (this == &other)
-    {
-        return *this;
-    }
-
-    auto* other_meta = get_meta(other._trusted_memory);
-    std::lock_guard lock(other_meta->mutex);
-    void* cloned = clone_state(other._trusted_memory);
-
-    this->~allocator_boundary_tags();
-    _trusted_memory = cloned;
-    return *this;
+    return {};
 }
 
 bool allocator_boundary_tags::do_is_equal(const std::pmr::memory_resource& other) const noexcept
@@ -400,69 +322,37 @@ bool allocator_boundary_tags::do_is_equal(const std::pmr::memory_resource& other
         return true;
     }
 
-    auto* other_ptr = dynamic_cast<const allocator_boundary_tags*>(&other);
-    return other_ptr != nullptr && other_ptr == this;
+    auto* rhs = dynamic_cast<const allocator_boundary_tags*>(&other);
+    return rhs != nullptr && _trusted_memory == rhs->_trusted_memory;
 }
 
-bool allocator_boundary_tags::boundary_iterator::operator==(
-    const allocator_boundary_tags::boundary_iterator& other) const noexcept
+bool allocator_boundary_tags::boundary_iterator::operator==(const allocator_boundary_tags::boundary_iterator& other) const noexcept
 {
-    if (_occupied_ptr == nullptr && other._occupied_ptr == nullptr)
-    {
-        return true;
-    }
-
-    return _occupied_ptr == other._occupied_ptr
-           && _occupied == other._occupied
-           && _trusted_memory == other._trusted_memory;
+    return _occupied_ptr == other._occupied_ptr && _trusted_memory == other._trusted_memory;
 }
 
-bool allocator_boundary_tags::boundary_iterator::operator!=(
-    const allocator_boundary_tags::boundary_iterator& other) const noexcept
+bool allocator_boundary_tags::boundary_iterator::operator!=(const allocator_boundary_tags::boundary_iterator& other) const noexcept
 {
     return !(*this == other);
 }
 
 allocator_boundary_tags::boundary_iterator& allocator_boundary_tags::boundary_iterator::operator++() & noexcept
 {
-    if (_trusted_memory == nullptr || _occupied_ptr == nullptr)
+    if (_occupied_ptr == nullptr || _trusted_memory == nullptr)
     {
         return *this;
     }
 
-    if (_occupied)
+    auto* allocator = static_cast<allocator_boundary_tags*>(_trusted_memory);
+    _occupied_ptr = static_cast<char*>(_occupied_ptr) + allocator_boundary_tags::get_size_block(_occupied_ptr);
+    if (_occupied_ptr >= allocator->get_memory_end())
     {
-        auto* block = reinterpret_cast<occupied_block*>(_occupied_ptr);
-        auto* next = next_physical_block(block);
-        auto* free_start = block_end(block);
-        auto* free_end = next == nullptr
-            ? region_end(_trusted_memory)
-            : reinterpret_cast<unsigned char*>(next);
-
-        if (free_start < free_end)
-        {
-            _occupied = false;
-            _occupied_ptr = free_start;
-        }
-        else if (next != nullptr)
-        {
-            _occupied_ptr = next;
-            _occupied = true;
-        }
-        else
-        {
-            _occupied_ptr = nullptr;
-        }
+        _occupied_ptr = nullptr;
+        _occupied = false;
     }
     else
     {
-        auto* current = first_block(_trusted_memory);
-        while (current != nullptr && reinterpret_cast<unsigned char*>(current) < _occupied_ptr)
-        {
-            current = current->next;
-        }
-        _occupied_ptr = current;
-        _occupied = current != nullptr;
+        _occupied = !allocator_boundary_tags::is_block_free(_occupied_ptr);
     }
 
     return *this;
@@ -470,63 +360,17 @@ allocator_boundary_tags::boundary_iterator& allocator_boundary_tags::boundary_it
 
 allocator_boundary_tags::boundary_iterator& allocator_boundary_tags::boundary_iterator::operator--() & noexcept
 {
-    if (_trusted_memory == nullptr)
+    if (_occupied_ptr == nullptr || _trusted_memory == nullptr)
     {
         return *this;
     }
 
-    if (_occupied_ptr == nullptr)
+    auto* allocator = static_cast<allocator_boundary_tags*>(_trusted_memory);
+    void* prev = *allocator_boundary_tags::get_prev_block(_occupied_ptr);
+    if (prev != nullptr && prev >= allocator->get_memory_start())
     {
-        auto* last = reinterpret_cast<occupied_block*>(get_meta(_trusted_memory)->last_occupied);
-        if (last == nullptr)
-        {
-            return *this;
-        }
-
-        const auto* end_ptr = region_end(_trusted_memory);
-        if (block_end(last) < end_ptr)
-        {
-            _occupied = false;
-            _occupied_ptr = const_cast<unsigned char*>(block_end(last));
-        }
-        else
-        {
-            _occupied = true;
-            _occupied_ptr = last;
-        }
-        return *this;
-    }
-
-    if (_occupied)
-    {
-        auto* block = reinterpret_cast<occupied_block*>(_occupied_ptr);
-        auto* prev = block->prev;
-        auto* prev_end = prev == nullptr
-            ? region_begin(_trusted_memory)
-            : block_end(prev);
-
-        if (prev_end < reinterpret_cast<unsigned char*>(block))
-        {
-            _occupied = false;
-            _occupied_ptr = prev_end;
-        }
-        else
-        {
-            _occupied_ptr = prev;
-            _occupied = prev != nullptr;
-        }
-    }
-    else
-    {
-        auto* current = first_block(_trusted_memory);
-        occupied_block* prev = nullptr;
-        while (current != nullptr && block_end(current) <= _occupied_ptr)
-        {
-            prev = current;
-            current = current->next;
-        }
         _occupied_ptr = prev;
-        _occupied = prev != nullptr;
+        _occupied = !allocator_boundary_tags::is_block_free(_occupied_ptr);
     }
 
     return *this;
@@ -548,27 +392,7 @@ allocator_boundary_tags::boundary_iterator allocator_boundary_tags::boundary_ite
 
 size_t allocator_boundary_tags::boundary_iterator::size() const noexcept
 {
-    if (_trusted_memory == nullptr || _occupied_ptr == nullptr)
-    {
-        return 0;
-    }
-
-    if (_occupied)
-    {
-        auto* block = reinterpret_cast<occupied_block*>(_occupied_ptr);
-        return sizeof(occupied_block) + block->payload_capacity;
-    }
-
-    auto* current = first_block(_trusted_memory);
-    while (current != nullptr && reinterpret_cast<unsigned char*>(current) < _occupied_ptr)
-    {
-        current = current->next;
-    }
-
-    auto* end = current == nullptr
-        ? region_end(_trusted_memory)
-        : reinterpret_cast<unsigned char*>(current);
-    return static_cast<size_t>(end - reinterpret_cast<unsigned char*>(_occupied_ptr));
+    return _occupied_ptr == nullptr ? 0 : allocator_boundary_tags::get_size_block(_occupied_ptr);
 }
 
 bool allocator_boundary_tags::boundary_iterator::occupied() const noexcept
@@ -578,54 +402,27 @@ bool allocator_boundary_tags::boundary_iterator::occupied() const noexcept
 
 void* allocator_boundary_tags::boundary_iterator::operator*() const noexcept
 {
-    if (_occupied_ptr == nullptr)
-    {
-        return nullptr;
-    }
-
-    return _occupied
-        ? reinterpret_cast<unsigned char*>(_occupied_ptr) + sizeof(occupied_block)
-        : _occupied_ptr;
+    return occupied() ? static_cast<char*>(_occupied_ptr) + occupied_block_metadata_size : nullptr;
 }
 
-allocator_boundary_tags::boundary_iterator::boundary_iterator() :
-    _occupied_ptr(nullptr),
-    _occupied(false),
-    _trusted_memory(nullptr)
+allocator_boundary_tags::boundary_iterator::boundary_iterator()
+    : _occupied_ptr(nullptr), _occupied(false), _trusted_memory(nullptr)
 {
 }
 
-allocator_boundary_tags::boundary_iterator::boundary_iterator(void* trusted) :
-    _occupied_ptr(nullptr),
-    _occupied(false),
-    _trusted_memory(trusted)
+allocator_boundary_tags::boundary_iterator::boundary_iterator(void* trusted)
+    : _occupied_ptr(nullptr), _occupied(false), _trusted_memory(trusted)
 {
-    if (trusted == nullptr)
+    if (_trusted_memory == nullptr)
     {
         return;
     }
 
-    auto* first = first_block(trusted);
-    if (first == nullptr)
+    auto* allocator = static_cast<allocator_boundary_tags*>(_trusted_memory);
+    if (allocator->get_memory_start() < allocator->get_memory_end())
     {
-        _occupied_ptr = region_begin(trusted);
-        _occupied = false;
-        if (_occupied_ptr == region_end(trusted))
-        {
-            _occupied_ptr = nullptr;
-        }
-        return;
-    }
-
-    if (region_begin(trusted) < reinterpret_cast<unsigned char*>(first))
-    {
-        _occupied_ptr = region_begin(trusted);
-        _occupied = false;
-    }
-    else
-    {
-        _occupied_ptr = first;
-        _occupied = true;
+        _occupied_ptr = allocator->get_memory_start();
+        _occupied = !allocator_boundary_tags::is_block_free(_occupied_ptr);
     }
 }
 

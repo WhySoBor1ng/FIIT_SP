@@ -4,6 +4,7 @@
 #include <pp_allocator.h>
 #include <allocator_test_utils.h>
 #include <allocator_with_fit_mode.h>
+#include <iterator>
 #include <mutex>
 
 class allocator_red_black_tree final:
@@ -13,6 +14,12 @@ class allocator_red_black_tree final:
 {
 
 private:
+
+    struct block_choice
+    {
+        void* block;
+        size_t size;
+    };
 
     enum class block_color : unsigned char
     { RED, BLACK };
@@ -34,16 +41,16 @@ public:
     ~allocator_red_black_tree() override;
     
     allocator_red_black_tree(
-        allocator_red_black_tree const &other);
+        allocator_red_black_tree const &other) = delete;
     
     allocator_red_black_tree &operator=(
-        allocator_red_black_tree const &other);
+        allocator_red_black_tree const &other) = delete;
     
     allocator_red_black_tree(
-        allocator_red_black_tree &&other) noexcept;
+        allocator_red_black_tree &&other) noexcept = delete;
     
     allocator_red_black_tree &operator=(
-        allocator_red_black_tree &&other) noexcept;
+        allocator_red_black_tree &&other) noexcept = delete;
 
 public:
     
@@ -67,6 +74,32 @@ private:
     inline void set_fit_mode(allocator_with_fit_mode::fit_mode mode) override;
 
 private:
+    [[nodiscard]] auto get_parent_alloc() const;
+    [[nodiscard]] auto get_fit_mode() const;
+    [[nodiscard]] auto get_full_size() const;
+    [[nodiscard]] auto get_mutex() const;
+    [[nodiscard]] auto get_root() const;
+    [[nodiscard]] auto get_memory_start() const;
+    [[nodiscard]] auto get_memory_end() const;
+
+    static auto get_metadata(void* block);
+    static auto get_size_ptr(void* block);
+    static auto get_prev_block(void* block);
+    static auto get_parent_node(void* block);
+    static auto get_left_node(void* block);
+    static auto get_right_node(void* block);
+
+    static auto get_block_size(void* block);
+    static auto is_block_free(void* block);
+    static void set_prev_block(void* block, void* prev);
+    static void set_color(void* block, block_color color);
+    static auto get_color(void* block);
+
+    void insert_free_block(void* block) const;
+    void remove_free_block(void* block) const;
+    [[nodiscard]] block_choice find_block(size_t needed) const;
+    void collect_suitable_block(void* block, size_t needed, block_choice& choice) const;
+    [[nodiscard]] static auto minimum(void* block);
 
     std::vector<allocator_test_utils::block_info> get_blocks_info_inner() const override;
 

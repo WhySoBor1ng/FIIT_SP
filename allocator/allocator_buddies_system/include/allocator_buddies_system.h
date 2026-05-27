@@ -1,31 +1,35 @@
 #ifndef MATH_PRACTICE_AND_OPERATING_SYSTEMS_ALLOCATOR_ALLOCATOR_BUDDIES_SYSTEM_H
 #define MATH_PRACTICE_AND_OPERATING_SYSTEMS_ALLOCATOR_ALLOCATOR_BUDDIES_SYSTEM_H
 
-#include <pp_allocator.h>
-#include <allocator_test_utils.h>
 #include <allocator_with_fit_mode.h>
+#include <allocator_test_utils.h>
+#include <pp_allocator.h>
+#include <cstdint>
+#include <iterator>
 #include <mutex>
-#include <cmath>
+
+struct allocator_buddies_header
+{
+    std::pmr::memory_resource* parent_alloc;
+    allocator_with_fit_mode::fit_mode fit_mode;
+    uint8_t max_pow;
+    std::mutex mutex;
+    void** free_blocks;
+    void* mem_st;
+};
 
 namespace __detail
 {
     constexpr size_t nearest_greater_k_of_2(size_t size) noexcept
     {
-        int ones_counter = 0, index = -1;
-
-        constexpr const size_t o = 1;
-
-        for (int i = sizeof(size_t) * 8 - 1; i >= 0; --i)
+        size_t exponent = 0;
+        size_t current = 1;
+        while (current < size)
         {
-            if (size & (o << i))
-            {
-                if (ones_counter == 0)
-                    index = i;
-                ++ones_counter;
-            }
+            current <<= 1;
+            ++exponent;
         }
-
-        return ones_counter <= 1 ? index : index + 1;
+        return exponent;
     }
 }
 
@@ -34,10 +38,6 @@ class allocator_buddies_system final:
     public allocator_test_utils,
     public allocator_with_fit_mode
 {
-
-private:
-
-
     struct block_metadata
     {
         bool occupied : 1;
@@ -46,17 +46,9 @@ private:
 
     void *_trusted_memory;
 
-    /**
-     * TODO: You must improve it for alignment support
-     */
-
-    static constexpr const size_t allocator_metadata_size = sizeof(allocator_dbg_helper*) + sizeof(fit_mode) + sizeof(unsigned char) + sizeof(std::mutex);
-
-    static constexpr const size_t occupied_block_metadata_size = sizeof(block_metadata) + sizeof(void*);
-
-    static constexpr const size_t free_block_metadata_size = sizeof(block_metadata);
-
-    static constexpr const size_t min_k = __detail::nearest_greater_k_of_2(occupied_block_metadata_size);
+    static constexpr size_t occupied_block_metadata_size = sizeof(block_metadata);
+    static constexpr size_t free_block_metadata_size = sizeof(block_metadata) + sizeof(void*);
+    static constexpr size_t min_k = __detail::nearest_greater_k_of_2(free_block_metadata_size);
 
 public:
 
@@ -66,16 +58,16 @@ public:
             allocator_with_fit_mode::fit_mode allocate_fit_mode = allocator_with_fit_mode::fit_mode::first_fit);
 
     allocator_buddies_system(
-        allocator_buddies_system const &other);
+        allocator_buddies_system const &other) = delete;
     
     allocator_buddies_system &operator=(
-        allocator_buddies_system const &other);
+        allocator_buddies_system const &other) = delete;
     
     allocator_buddies_system(
-        allocator_buddies_system &&other) noexcept;
+        allocator_buddies_system &&other) noexcept = delete;
     
     allocator_buddies_system &operator=(
-        allocator_buddies_system &&other) noexcept;
+        allocator_buddies_system &&other) noexcept = delete;
 
     ~allocator_buddies_system() override;
 
@@ -96,14 +88,35 @@ private:
     std::vector<allocator_test_utils::block_info> get_blocks_info() const noexcept override;
 
 private:
+    [[nodiscard]] auto get_parent_alloc() const;
+    [[nodiscard]] auto get_fit_mode() const;
+    [[nodiscard]] auto get_max_pow() const;
+    [[nodiscard]] auto get_full_size() const;
+    [[nodiscard]] auto get_free_lists_count() const;
+    [[nodiscard]] auto get_reserved_size() const;
+    [[nodiscard]] auto get_mutex() const;
+    [[nodiscard]] auto get_head() const;
+    [[nodiscard]] auto get_memory_start() const;
+    [[nodiscard]] auto get_memory_end() const;
+
+    static auto get_metadata(void* block);
+    static auto get_next_block(void* block);
+    static auto get_block_size(void* block);
+    static auto get_buddy(void* block, uint8_t rank, void* memory_start);
+    static auto choose_rank(size_t size);
+
+    void insert_free_block(void* block, uint8_t rank) const;
+    void remove_free_block(void* block, uint8_t rank) const;
+
+    [[nodiscard]] auto find_suitable_block(uint8_t required_rank) const;
+    [[nodiscard]] auto split_block(void* block, uint8_t current_rank, uint8_t target_rank) const;
 
     std::vector<allocator_test_utils::block_info> get_blocks_info_inner() const override;
-
-    /** TODO: Highly recommended for helper functions to return references */
 
     class buddy_iterator
     {
         void* _block;
+        void* _end;
 
     public:
 
@@ -129,7 +142,7 @@ private:
 
         buddy_iterator();
 
-        buddy_iterator(void* start);
+        buddy_iterator(void* start, void* end);
     };
 
     friend class buddy_iterator;

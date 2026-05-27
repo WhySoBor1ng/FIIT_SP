@@ -3,7 +3,7 @@ add_subdirectory(tests)
 add_library(
         sys_prog_assctv_cntnr_indxng_tr_b_tr
         include/b_tree.h
-        src/hhh.cpp)
+        src/b_tree.cpp)
 
 target_include_directories(
         sys_prog_assctv_cntnr_indxng_tr_b_tr

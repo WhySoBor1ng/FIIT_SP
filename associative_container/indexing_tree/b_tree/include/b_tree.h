@@ -3,6 +3,7 @@
 
 #include <initializer_list>
 #include <iterator>
+#include <optional>
 #include <stack>
 #include <stdexcept>
 #include <utility>
@@ -1376,13 +1377,16 @@ public:
         }
 
         tkey key = pos->first;
-        ++pos;
-        erase(key);
-        if (pos == end())
+        std::optional<tkey> next_key;
+        auto next = pos;
+        ++next;
+        if (next != end())
         {
-            return end();
+            next_key = next->first;
         }
-        return find(pos->first);
+
+        erase(key);
+        return next_key.has_value() ? find(*next_key) : end();
     }
 
     btree_iterator erase(btree_const_iterator pos)
@@ -1393,37 +1397,60 @@ public:
         }
 
         tkey key = pos->first;
+        std::optional<tkey> next_key;
         auto next = pos;
         ++next;
-        erase(key);
-        if (next == cend())
+        if (next != cend())
         {
-            return end();
+            next_key = next->first;
         }
-        return find(next->first);
+
+        erase(key);
+        return next_key.has_value() ? find(*next_key) : end();
     }
 
     btree_iterator erase(btree_iterator beg, btree_iterator en)
     {
-        while (beg != en)
+        std::vector<tkey> keys_to_erase;
+        for (auto current = beg; current != en; ++current)
         {
-            beg = erase(beg);
+            keys_to_erase.push_back(current->first);
         }
-        return en;
+
+        std::optional<tkey> next_key;
+        if (en != end())
+        {
+            next_key = en->first;
+        }
+
+        for (const auto &key : keys_to_erase)
+        {
+            erase(key);
+        }
+
+        return next_key.has_value() ? find(*next_key) : end();
     }
 
     btree_iterator erase(btree_const_iterator beg, btree_const_iterator en)
     {
-        while (beg != en)
+        std::vector<tkey> keys_to_erase;
+        for (auto current = beg; current != en; ++current)
         {
-            beg = btree_const_iterator(erase(beg));
+            keys_to_erase.push_back(current->first);
         }
 
-        if (en == cend())
+        std::optional<tkey> next_key;
+        if (en != cend())
         {
-            return end();
+            next_key = en->first;
         }
-        return find(en->first);
+
+        for (const auto &key : keys_to_erase)
+        {
+            erase(key);
+        }
+
+        return next_key.has_value() ? find(*next_key) : end();
     }
 
     btree_iterator erase(const tkey &key)
@@ -1434,8 +1461,13 @@ public:
             return end();
         }
 
+        std::optional<tkey> next_key;
         auto next = current;
         ++next;
+        if (next != end())
+        {
+            next_key = next->first;
+        }
 
         if (!erase_key_from_node(_root, key))
         {
@@ -1458,11 +1490,7 @@ public:
             free_node(old_root);
         }
 
-        if (next == end())
-        {
-            return end();
-        }
-        return find(next->first);
+        return next_key.has_value() ? find(*next_key) : end();
     }
 };
 

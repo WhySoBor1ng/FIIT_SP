@@ -1,108 +1,206 @@
 #include "../include/allocator_red_black_tree.h"
 
-#include <algorithm>
-#include <cstring>
-#include <memory>
+#include <memory_resource>
 #include <new>
-#include <utility>
+#include <stdexcept>
 
-namespace
+auto allocator_red_black_tree::get_parent_alloc() const
 {
-    using byte = unsigned char;
+    return static_cast<memory_resource**>(_trusted_memory);
+}
 
-    struct extent final
-    {
-        size_t offset;
-        size_t size;
-        bool occupied;
-        extent* prev;
-        extent* next;
-    };
+auto allocator_red_black_tree::get_fit_mode() const
+{
+    return reinterpret_cast<fit_mode*>(static_cast<char*>(_trusted_memory) + sizeof(memory_resource*));
+}
 
-    struct rb_allocator_meta final
-    {
-        std::pmr::memory_resource* parent_allocator;
-        allocator_with_fit_mode::fit_mode fit_mode;
-        size_t managed_size;
-        std::mutex mutex;
-        byte* region;
-        extent* head;
-    };
+auto allocator_red_black_tree::get_full_size() const
+{
+    return reinterpret_cast<size_t*>(static_cast<char*>(_trusted_memory) + sizeof(memory_resource*) + sizeof(fit_mode));
+}
 
-    rb_allocator_meta* get_meta(void* trusted) noexcept
+auto allocator_red_black_tree::get_mutex() const
+{
+    return reinterpret_cast<std::mutex*>(static_cast<char*>(_trusted_memory) + sizeof(memory_resource*) + sizeof(fit_mode) + sizeof(size_t));
+}
+
+auto allocator_red_black_tree::get_root() const
+{
+    return reinterpret_cast<void**>(static_cast<char*>(_trusted_memory) + sizeof(memory_resource*) + sizeof(fit_mode) + sizeof(size_t) + sizeof(std::mutex));
+}
+
+auto allocator_red_black_tree::get_memory_start() const
+{
+    return static_cast<char*>(_trusted_memory) + allocator_metadata_size;
+}
+
+auto allocator_red_black_tree::get_memory_end() const
+{
+    return static_cast<char*>(_trusted_memory) + *get_full_size();
+}
+
+auto allocator_red_black_tree::get_metadata(void* block)
+{
+    return static_cast<block_data*>(block);
+}
+
+auto allocator_red_black_tree::get_size_ptr(void* block)
+{
+    return reinterpret_cast<size_t*>(static_cast<char*>(block) + sizeof(block_data));
+}
+
+auto allocator_red_black_tree::get_prev_block(void* block)
+{
+    return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(block_data) + sizeof(size_t));
+}
+
+auto allocator_red_black_tree::get_parent_node(void* block)
+{
+    return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(block_data) + sizeof(size_t) + sizeof(void*));
+}
+
+auto allocator_red_black_tree::get_left_node(void* block)
+{
+    return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(block_data) + sizeof(size_t) + 2 * sizeof(void*));
+}
+
+auto allocator_red_black_tree::get_right_node(void* block)
+{
+    return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(block_data) + sizeof(size_t) + 3 * sizeof(void*));
+}
+
+auto allocator_red_black_tree::get_block_size(void* block)
+{
+    return *get_size_ptr(block);
+}
+
+auto allocator_red_black_tree::is_block_free(void* block)
+{
+    return !get_metadata(block)->occupied;
+}
+
+void allocator_red_black_tree::set_prev_block(void* block, void* prev)
+{
+    *get_prev_block(block) = prev;
+}
+
+void allocator_red_black_tree::set_color(void* block, block_color color)
+{
+    get_metadata(block)->color = color;
+}
+
+auto allocator_red_black_tree::get_color(void* block)
+{
+    return get_metadata(block)->color;
+}
+
+void allocator_red_black_tree::insert_free_block(void* block) const
+{
+    get_metadata(block)->occupied = false;
+    set_color(block, block_color::BLACK);
+    *get_parent_node(block) = nullptr;
+    *get_left_node(block) = nullptr;
+    *get_right_node(block) = nullptr;
+
+    void** link = get_root();
+    void* parent = nullptr;
+    while (*link != nullptr)
     {
-        return reinterpret_cast<rb_allocator_meta*>(trusted);
+        parent = *link;
+        bool goes_left = get_block_size(block) < get_block_size(parent)
+            || (get_block_size(block) == get_block_size(parent) && block < parent);
+        link = goes_left ? get_left_node(parent) : get_right_node(parent);
     }
 
-    const rb_allocator_meta* get_meta(const void* trusted) noexcept
-    {
-        return reinterpret_cast<const rb_allocator_meta*>(trusted);
-    }
+    *link = block;
+    *get_parent_node(block) = parent;
+}
 
-    extent* make_extent(
-        size_t offset,
-        size_t size,
-        bool occupied,
-        extent* prev = nullptr,
-        extent* next = nullptr)
+auto allocator_red_black_tree::minimum(void* block)
+{
+    while (block != nullptr && *get_left_node(block) != nullptr)
     {
-        return new extent{offset, size, occupied, prev, next};
+        block = *get_left_node(block);
     }
+    return block;
+}
 
-    void destroy_extents(extent* head) noexcept
-    {
-        while (head != nullptr)
+void allocator_red_black_tree::remove_free_block(void* block) const
+{
+    auto replace_link = [&](void* node) -> void** {
+        void* parent = *get_parent_node(node);
+        if (parent == nullptr)
         {
-            auto* next = head->next;
-            delete head;
-            head = next;
+            return get_root();
+        }
+        return *get_left_node(parent) == node ? get_left_node(parent) : get_right_node(parent);
+    };
+
+    auto transplant = [&](void* target, void* replacement) {
+        *replace_link(target) = replacement;
+        if (replacement != nullptr)
+        {
+            *get_parent_node(replacement) = *get_parent_node(target);
+        }
+    };
+
+    if (*get_left_node(block) == nullptr)
+    {
+        transplant(block, *get_right_node(block));
+    }
+    else if (*get_right_node(block) == nullptr)
+    {
+        transplant(block, *get_left_node(block));
+    }
+    else
+    {
+        void* successor = minimum(*get_right_node(block));
+        if (*get_parent_node(successor) != block)
+        {
+            transplant(successor, *get_right_node(successor));
+            *get_right_node(successor) = *get_right_node(block);
+            *get_parent_node(*get_right_node(successor)) = successor;
+        }
+
+        transplant(block, successor);
+        *get_left_node(successor) = *get_left_node(block);
+        *get_parent_node(*get_left_node(successor)) = successor;
+    }
+
+    *get_parent_node(block) = nullptr;
+    *get_left_node(block) = nullptr;
+    *get_right_node(block) = nullptr;
+}
+
+void allocator_red_black_tree::collect_suitable_block(void* block, size_t needed, block_choice& choice) const
+{
+    if (block == nullptr)
+    {
+        return;
+    }
+
+    collect_suitable_block(*get_left_node(block), needed, choice);
+
+    size_t block_size = get_block_size(block);
+    if (block_size >= needed)
+    {
+        if (choice.block == nullptr
+            || (*get_fit_mode() == fit_mode::first_fit && block_size < choice.size)
+            || (*get_fit_mode() == fit_mode::the_best_fit && block_size < choice.size)
+            || (*get_fit_mode() == fit_mode::the_worst_fit && block_size > choice.size))
+        {
+            choice = {block, block_size};
         }
     }
 
-    extent* clone_extents(extent* source_head)
-    {
-        extent* new_head = nullptr;
-        extent* tail = nullptr;
+    collect_suitable_block(*get_right_node(block), needed, choice);
+}
 
-        for (auto* current = source_head; current != nullptr; current = current->next)
-        {
-            auto* node = make_extent(current->offset, current->size, current->occupied, tail, nullptr);
-            if (tail == nullptr)
-            {
-                new_head = node;
-            }
-            else
-            {
-                tail->next = node;
-            }
-            tail = node;
-        }
-
-        return new_head;
-    }
-
-    void* clone_state(const void* source_trusted)
-    {
-        const auto* source_meta = get_meta(source_trusted);
-        auto* parent_allocator = source_meta->parent_allocator == nullptr
-            ? std::pmr::get_default_resource()
-            : source_meta->parent_allocator;
-
-        const auto total_size = sizeof(rb_allocator_meta) + source_meta->managed_size;
-        void* new_memory = parent_allocator->allocate(total_size, alignof(std::max_align_t));
-        auto* new_meta = new (new_memory) rb_allocator_meta{
-            parent_allocator,
-            source_meta->fit_mode,
-            source_meta->managed_size,
-            std::mutex{},
-            reinterpret_cast<byte*>(new_memory) + sizeof(rb_allocator_meta),
-            nullptr
-        };
-
-        std::memcpy(new_meta->region, source_meta->region, source_meta->managed_size);
-        new_meta->head = clone_extents(source_meta->head);
-        return new_memory;
-    }
+allocator_red_black_tree::block_choice allocator_red_black_tree::find_block(size_t needed) const
+{
+    block_choice choice{nullptr, 0};
+    collect_suitable_block(*get_root(), needed, choice);
+    return choice;
 }
 
 allocator_red_black_tree::~allocator_red_black_tree()
@@ -112,85 +210,137 @@ allocator_red_black_tree::~allocator_red_black_tree()
         return;
     }
 
-    auto* meta = get_meta(_trusted_memory);
-    auto* parent_allocator = meta->parent_allocator == nullptr
-        ? std::pmr::get_default_resource()
-        : meta->parent_allocator;
-    const auto total_size = sizeof(rb_allocator_meta) + meta->managed_size;
-
-    destroy_extents(meta->head);
-    meta->mutex.~mutex();
-    parent_allocator->deallocate(_trusted_memory, total_size, alignof(std::max_align_t));
-    _trusted_memory = nullptr;
-}
-
-allocator_red_black_tree::allocator_red_black_tree(
-    allocator_red_black_tree&& other) noexcept :
-    _trusted_memory(other._trusted_memory)
-{
-    other._trusted_memory = nullptr;
-}
-
-allocator_red_black_tree& allocator_red_black_tree::operator=(
-    allocator_red_black_tree&& other) noexcept
-{
-    if (this == &other)
+    get_mutex()->~mutex();
+    if (auto* parent = *get_parent_alloc(); parent != nullptr)
     {
-        return *this;
+        parent->deallocate(_trusted_memory, *get_full_size());
     }
-
-    this->~allocator_red_black_tree();
-    _trusted_memory = other._trusted_memory;
-    other._trusted_memory = nullptr;
-    return *this;
+    else
+    {
+        ::operator delete(_trusted_memory);
+    }
 }
 
 allocator_red_black_tree::allocator_red_black_tree(
     size_t space_size,
     std::pmr::memory_resource* parent_allocator,
-    allocator_with_fit_mode::fit_mode allocate_fit_mode) :
-    _trusted_memory(nullptr)
+    allocator_with_fit_mode::fit_mode allocate_fit_mode)
 {
-    auto* real_parent_allocator = parent_allocator == nullptr
-        ? std::pmr::get_default_resource()
-        : parent_allocator;
-
-    const auto total_size = sizeof(rb_allocator_meta) + space_size;
-    _trusted_memory = real_parent_allocator->allocate(total_size, alignof(std::max_align_t));
-
-    auto* meta = new (_trusted_memory) rb_allocator_meta{
-        real_parent_allocator,
-        allocate_fit_mode,
-        space_size,
-        std::mutex{},
-        reinterpret_cast<byte*>(_trusted_memory) + sizeof(rb_allocator_meta),
-        nullptr
-    };
-
-    meta->head = make_extent(0, space_size, false);
-}
-
-allocator_red_black_tree::allocator_red_black_tree(const allocator_red_black_tree& other) :
-    _trusted_memory(nullptr)
-{
-    std::lock_guard lock(get_meta(other._trusted_memory)->mutex);
-    _trusted_memory = clone_state(other._trusted_memory);
-}
-
-allocator_red_black_tree& allocator_red_black_tree::operator=(const allocator_red_black_tree& other)
-{
-    if (this == &other)
+    if (space_size < free_block_metadata_size)
     {
-        return *this;
+        throw std::logic_error("space size is too small");
     }
 
-    auto* other_meta = get_meta(other._trusted_memory);
-    std::lock_guard lock(other_meta->mutex);
-    void* cloned = clone_state(other._trusted_memory);
+    size_t total_size = allocator_metadata_size + space_size;
+    _trusted_memory = parent_allocator != nullptr
+        ? parent_allocator->allocate(total_size)
+        : ::operator new(total_size);
 
-    this->~allocator_red_black_tree();
-    _trusted_memory = cloned;
-    return *this;
+    *get_parent_alloc() = parent_allocator;
+    *get_fit_mode() = allocate_fit_mode;
+    *get_full_size() = total_size;
+    new (get_mutex()) std::mutex();
+    *get_root() = nullptr;
+
+    void* first_block = get_memory_start();
+    get_metadata(first_block)->occupied = false;
+    set_color(first_block, block_color::BLACK);
+    *get_size_ptr(first_block) = space_size;
+    *get_prev_block(first_block) = nullptr;
+    insert_free_block(first_block);
+}
+
+[[nodiscard]] void* allocator_red_black_tree::do_allocate_sm(size_t size)
+{
+    std::lock_guard lock(*get_mutex());
+
+    size_t needed = size + occupied_block_metadata_size;
+    block_choice choice = find_block(needed);
+    if (choice.block == nullptr)
+    {
+        throw std::bad_alloc();
+    }
+
+    void* prev_block = *get_prev_block(choice.block);
+    remove_free_block(choice.block);
+
+    size_t remainder = choice.size - needed;
+    if (remainder >= free_block_metadata_size)
+    {
+        void* free_block = static_cast<char*>(choice.block) + needed;
+        get_metadata(choice.block)->occupied = true;
+        *get_size_ptr(choice.block) = needed;
+        set_prev_block(choice.block, prev_block);
+
+        get_metadata(free_block)->occupied = false;
+        set_color(free_block, block_color::BLACK);
+        *get_size_ptr(free_block) = remainder;
+        set_prev_block(free_block, choice.block);
+        *get_parent_node(free_block) = nullptr;
+        *get_left_node(free_block) = nullptr;
+        *get_right_node(free_block) = nullptr;
+
+        char* next = static_cast<char*>(free_block) + remainder;
+        if (next < get_memory_end())
+        {
+            set_prev_block(next, free_block);
+        }
+
+        insert_free_block(free_block);
+    }
+    else
+    {
+        get_metadata(choice.block)->occupied = true;
+        *get_size_ptr(choice.block) = choice.size;
+        set_prev_block(choice.block, prev_block);
+    }
+
+    return static_cast<char*>(choice.block) + occupied_block_metadata_size;
+}
+
+void allocator_red_black_tree::do_deallocate_sm(void* at)
+{
+    std::lock_guard lock(*get_mutex());
+
+    if (at == nullptr)
+    {
+        return;
+    }
+
+    char* data = static_cast<char*>(at);
+    if (data < get_memory_start() || data >= get_memory_end())
+    {
+        throw std::invalid_argument("block bounds are invalid");
+    }
+
+    void* block = data - occupied_block_metadata_size;
+    if (is_block_free(block))
+    {
+        throw std::invalid_argument("block is free");
+    }
+
+    get_metadata(block)->occupied = false;
+    if (void* prev = *get_prev_block(block); prev != nullptr && is_block_free(prev))
+    {
+        remove_free_block(prev);
+        *get_size_ptr(prev) = get_block_size(prev) + get_block_size(block);
+        block = prev;
+    }
+
+    char* next = static_cast<char*>(block) + get_block_size(block);
+    if (next < get_memory_end() && is_block_free(next))
+    {
+        remove_free_block(next);
+        *get_size_ptr(block) = get_block_size(block) + get_block_size(next);
+    }
+
+    next = static_cast<char*>(block) + get_block_size(block);
+    if (next < get_memory_end())
+    {
+        set_prev_block(next, block);
+    }
+
+    insert_free_block(block);
 }
 
 bool allocator_red_black_tree::do_is_equal(const std::pmr::memory_resource& other) const noexcept
@@ -200,158 +350,47 @@ bool allocator_red_black_tree::do_is_equal(const std::pmr::memory_resource& othe
         return true;
     }
 
-    auto* other_ptr = dynamic_cast<const allocator_red_black_tree*>(&other);
-    return other_ptr != nullptr && other_ptr == this;
-}
-
-[[nodiscard]] void* allocator_red_black_tree::do_allocate_sm(
-    size_t size)
-{
-    auto* meta = get_meta(_trusted_memory);
-    std::lock_guard lock(meta->mutex);
-
-    if (size == 0)
-    {
-        size = 1;
-    }
-
-    extent* selected = nullptr;
-    for (auto* current = meta->head; current != nullptr; current = current->next)
-    {
-        if (current->occupied || current->size < size)
-        {
-            continue;
-        }
-
-        if (meta->fit_mode == fit_mode::first_fit)
-        {
-            selected = current;
-            break;
-        }
-
-        if (selected == nullptr
-            || (meta->fit_mode == fit_mode::the_best_fit && current->size < selected->size)
-            || (meta->fit_mode == fit_mode::the_worst_fit && current->size > selected->size))
-        {
-            selected = current;
-        }
-    }
-
-    if (selected == nullptr)
-    {
-        throw std::bad_alloc();
-    }
-
-    if (selected->size > size)
-    {
-        auto* tail = make_extent(selected->offset + size, selected->size - size, false, selected, selected->next);
-        if (selected->next != nullptr)
-        {
-            selected->next->prev = tail;
-        }
-        selected->next = tail;
-        selected->size = size;
-    }
-
-    selected->occupied = true;
-    return meta->region + selected->offset;
-}
-
-void allocator_red_black_tree::do_deallocate_sm(
-    void* at)
-{
-    if (at == nullptr)
-    {
-        return;
-    }
-
-    auto* meta = get_meta(_trusted_memory);
-    std::lock_guard lock(meta->mutex);
-
-    auto* byte_at = reinterpret_cast<byte*>(at);
-    if (byte_at < meta->region || byte_at >= meta->region + meta->managed_size)
-    {
-        return;
-    }
-
-    const auto offset = static_cast<size_t>(byte_at - meta->region);
-    extent* block = nullptr;
-    for (auto* current = meta->head; current != nullptr; current = current->next)
-    {
-        if (current->offset == offset)
-        {
-            block = current;
-            break;
-        }
-    }
-
-    if (block == nullptr || !block->occupied)
-    {
-        return;
-    }
-
-    block->occupied = false;
-
-    if (block->next != nullptr && !block->next->occupied)
-    {
-        auto* next = block->next;
-        block->size += next->size;
-        block->next = next->next;
-        if (next->next != nullptr)
-        {
-            next->next->prev = block;
-        }
-        delete next;
-    }
-
-    if (block->prev != nullptr && !block->prev->occupied)
-    {
-        auto* prev = block->prev;
-        prev->size += block->size;
-        prev->next = block->next;
-        if (block->next != nullptr)
-        {
-            block->next->prev = prev;
-        }
-        delete block;
-    }
+    auto* rhs = dynamic_cast<const allocator_red_black_tree*>(&other);
+    return rhs != nullptr && rhs->_trusted_memory == _trusted_memory;
 }
 
 void allocator_red_black_tree::set_fit_mode(allocator_with_fit_mode::fit_mode mode)
 {
-    std::lock_guard lock(get_meta(_trusted_memory)->mutex);
-    get_meta(_trusted_memory)->fit_mode = mode;
+    std::lock_guard lock(*get_mutex());
+    *get_fit_mode() = mode;
 }
 
 std::vector<allocator_test_utils::block_info> allocator_red_black_tree::get_blocks_info() const
 {
-    std::lock_guard lock(get_meta(_trusted_memory)->mutex);
+    std::lock_guard lock(*get_mutex());
     return get_blocks_info_inner();
 }
 
 std::vector<allocator_test_utils::block_info> allocator_red_black_tree::get_blocks_info_inner() const
 {
-    std::vector<allocator_test_utils::block_info> result;
-    for (auto it = begin(); it != end(); ++it)
+    std::vector<block_info> result;
+
+    for (char* block = get_memory_start(); block < get_memory_end(); block += get_block_size(block))
     {
-        result.push_back({it.size(), it.occupied()});
+        result.push_back({get_block_size(block), !is_block_free(block)});
     }
+
     return result;
 }
 
 allocator_red_black_tree::rb_iterator allocator_red_black_tree::begin() const noexcept
 {
-    return rb_iterator(_trusted_memory);
+    return {const_cast<allocator_red_black_tree*>(this)};
 }
 
 allocator_red_black_tree::rb_iterator allocator_red_black_tree::end() const noexcept
 {
-    return rb_iterator();
+    return {};
 }
 
 bool allocator_red_black_tree::rb_iterator::operator==(const allocator_red_black_tree::rb_iterator& other) const noexcept
 {
-    return _block_ptr == other._block_ptr;
+    return _block_ptr == other._block_ptr && _trusted == other._trusted;
 }
 
 bool allocator_red_black_tree::rb_iterator::operator!=(const allocator_red_black_tree::rb_iterator& other) const noexcept
@@ -361,10 +400,18 @@ bool allocator_red_black_tree::rb_iterator::operator!=(const allocator_red_black
 
 allocator_red_black_tree::rb_iterator& allocator_red_black_tree::rb_iterator::operator++() & noexcept
 {
-    if (_block_ptr != nullptr)
+    if (_block_ptr == nullptr || _trusted == nullptr)
     {
-        _block_ptr = reinterpret_cast<extent*>(_block_ptr)->next;
+        return *this;
     }
+
+    auto* allocator = static_cast<allocator_red_black_tree*>(_trusted);
+    _block_ptr = static_cast<char*>(_block_ptr) + allocator_red_black_tree::get_block_size(_block_ptr);
+    if (_block_ptr >= allocator->get_memory_end())
+    {
+        _block_ptr = nullptr;
+    }
+
     return *this;
 }
 
@@ -377,33 +424,35 @@ allocator_red_black_tree::rb_iterator allocator_red_black_tree::rb_iterator::ope
 
 size_t allocator_red_black_tree::rb_iterator::size() const noexcept
 {
-    return _block_ptr == nullptr ? 0 : reinterpret_cast<extent*>(_block_ptr)->size;
+    return _block_ptr == nullptr ? 0 : allocator_red_black_tree::get_block_size(_block_ptr);
 }
 
 void* allocator_red_black_tree::rb_iterator::operator*() const noexcept
 {
-    if (_block_ptr == nullptr || _trusted == nullptr)
+    return occupied() ? static_cast<char*>(_block_ptr) + occupied_block_metadata_size : nullptr;
+}
+
+allocator_red_black_tree::rb_iterator::rb_iterator()
+    : _block_ptr(nullptr), _trusted(nullptr)
+{
+}
+
+allocator_red_black_tree::rb_iterator::rb_iterator(void* trusted)
+    : _block_ptr(nullptr), _trusted(trusted)
+{
+    if (_trusted == nullptr)
     {
-        return nullptr;
+        return;
     }
 
-    const auto* meta = get_meta(_trusted);
-    return meta->region + reinterpret_cast<extent*>(_block_ptr)->offset;
-}
-
-allocator_red_black_tree::rb_iterator::rb_iterator() :
-    _block_ptr(nullptr),
-    _trusted(nullptr)
-{
-}
-
-allocator_red_black_tree::rb_iterator::rb_iterator(void* trusted) :
-    _block_ptr(trusted == nullptr ? nullptr : get_meta(trusted)->head),
-    _trusted(trusted)
-{
+    auto* allocator = static_cast<allocator_red_black_tree*>(_trusted);
+    if (allocator->get_memory_start() < allocator->get_memory_end())
+    {
+        _block_ptr = allocator->get_memory_start();
+    }
 }
 
 bool allocator_red_black_tree::rb_iterator::occupied() const noexcept
 {
-    return _block_ptr != nullptr && reinterpret_cast<extent*>(_block_ptr)->occupied;
+    return _block_ptr != nullptr && !allocator_red_black_tree::is_block_free(_block_ptr);
 }

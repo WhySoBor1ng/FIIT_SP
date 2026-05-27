@@ -6,6 +6,7 @@
 #include <allocator_with_fit_mode.h>
 #include <iterator>
 #include <mutex>
+#include <utility>
 
 class allocator_sorted_list final:
     public smart_mem_resource,
@@ -17,9 +18,9 @@ private:
     
     void *_trusted_memory;
 
-    static constexpr const size_t allocator_metadata_size = sizeof(std::pmr::memory_resource *) + sizeof(fit_mode) + sizeof(size_t) + sizeof(std::mutex) + sizeof(void*);
+    static constexpr size_t allocator_metadata_size = sizeof(std::pmr::memory_resource *) + sizeof(fit_mode) + sizeof(size_t) + sizeof(std::mutex) + sizeof(void*);
 
-    static constexpr const size_t block_metadata_size = sizeof(void*) + sizeof(size_t);
+    static constexpr size_t block_metadata_size = sizeof(void*) + sizeof(size_t);
 
 public:
 
@@ -29,20 +30,27 @@ public:
             allocator_with_fit_mode::fit_mode allocate_fit_mode = allocator_with_fit_mode::fit_mode::first_fit);
     
     allocator_sorted_list(
-        allocator_sorted_list const &other);
+        allocator_sorted_list const &other) = delete;
     
     allocator_sorted_list &operator=(
-        allocator_sorted_list const &other);
+        allocator_sorted_list const &other) = delete;
 
     allocator_sorted_list(
-        allocator_sorted_list &&other) noexcept;
+        allocator_sorted_list &&other) noexcept = delete;
     
     allocator_sorted_list &operator=(
-        allocator_sorted_list &&other) noexcept;
+        allocator_sorted_list &&other) noexcept = delete;
 
     ~allocator_sorted_list() override;
 
 private:
+
+    struct block_choice
+    {
+        void* block;
+        void* prev;
+        size_t size;
+    };
     
     [[nodiscard]] void *do_allocate_sm(
         size_t size) override;
@@ -57,9 +65,37 @@ private:
 
     std::vector<allocator_test_utils::block_info> get_blocks_info() const noexcept override;
 
+    [[nodiscard]] auto get_parent_alloc() const;
+
+    [[nodiscard]] auto get_fit_mode() const;
+
+    [[nodiscard]] auto get_full_size() const;
+
+    [[nodiscard]] auto get_mutex() const;
+
+    [[nodiscard]] auto get_head() const;
+
+    [[nodiscard]] auto get_memory_start() const;
+
+    [[nodiscard]] auto get_memory_end() const;
+
+    static auto get_size_ptr(void* block);
+
+    static auto get_next_ptr(void* block);
+
+    static auto get_block_size(void* block);
+
+    static auto is_block_free(void* block);
+
+    void insert_free_block(void* block) const;
+
+    void remove_free_block(void* block, void* prev) const;
+
+    [[nodiscard]] block_choice find_block(size_t needed) const;
+
 private:
 
-    std::vector<allocator_test_utils::block_info> get_blocks_info_inner() const override;
+    [[nodiscard]] std::vector<allocator_test_utils::block_info> get_blocks_info_inner() const override;
 
     class sorted_free_iterator
     {
@@ -121,13 +157,15 @@ private:
         sorted_iterator();
 
         sorted_iterator(void* trusted);
+
+        void set_trusted_memory(void* mem) noexcept;
     };
 
     friend class sorted_iterator;
     friend class sorted_free_iterator;
 
     sorted_free_iterator free_begin() const noexcept;
-    sorted_free_iterator free_end() const noexcept;
+    static sorted_free_iterator free_end() noexcept;
 
     sorted_iterator begin() const noexcept;
     sorted_iterator end() const noexcept;

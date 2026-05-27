@@ -1,169 +1,176 @@
 #include "../include/allocator_buddies_system.h"
 
-#include <algorithm>
-#include <cstring>
-#include <memory>
 #include <new>
-#include <utility>
+#include <stdexcept>
 
-namespace
+constexpr size_t rank_to_size(const uint8_t rank) noexcept
 {
-    constexpr unsigned char max_supported_order = static_cast<unsigned char>(sizeof(size_t) * 8 - 1);
+    return static_cast<size_t>(1) << rank;
+}
 
-    struct local_block_metadata final
-    {
-        bool occupied : 1;
-        unsigned char size : 7;
-    };
+auto allocator_buddies_system::get_parent_alloc() const
+{
+    return &static_cast<allocator_buddies_header*>(_trusted_memory)->parent_alloc;
+}
 
-    struct buddies_allocator_meta final
-    {
-        std::pmr::memory_resource* parent_allocator;
-        allocator_with_fit_mode::fit_mode fit_mode;
-        unsigned char max_order;
-        unsigned char min_order;
-        std::mutex mutex;
-        void* free_heads[sizeof(size_t) * 8]{};
-    };
+auto allocator_buddies_system::get_fit_mode() const
+{
+    return &static_cast<allocator_buddies_header*>(_trusted_memory)->fit_mode;
+}
 
-    local_block_metadata* get_block_metadata(void* block) noexcept
+auto allocator_buddies_system::get_max_pow() const
+{
+    return &static_cast<allocator_buddies_header*>(_trusted_memory)->max_pow;
+}
+
+auto allocator_buddies_system::get_full_size() const
+{
+    return rank_to_size(*get_max_pow());
+}
+
+auto allocator_buddies_system::get_free_lists_count() const
+{
+    return static_cast<size_t>(*get_max_pow() - min_k + 1);
+}
+
+auto allocator_buddies_system::get_reserved_size() const
+{
+    return sizeof(allocator_buddies_header) + get_free_lists_count() * sizeof(void*) + get_full_size();
+}
+
+auto allocator_buddies_system::get_mutex() const
+{
+    return &static_cast<allocator_buddies_header*>(_trusted_memory)->mutex;
+}
+
+auto allocator_buddies_system::get_head() const
+{
+    return static_cast<allocator_buddies_header*>(_trusted_memory)->free_blocks;
+}
+
+auto allocator_buddies_system::get_memory_start() const
+{
+    return static_cast<char*>(static_cast<allocator_buddies_header*>(_trusted_memory)->mem_st);
+}
+
+auto allocator_buddies_system::get_memory_end() const
+{
+    return get_memory_start() + get_full_size();
+}
+
+auto allocator_buddies_system::get_metadata(void* block)
+{
+    return static_cast<block_metadata*>(block);
+}
+
+auto allocator_buddies_system::get_next_block(void* block)
+{
+    return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(block_metadata));
+}
+
+auto allocator_buddies_system::get_block_size(void* block)
+{
+    return rank_to_size(get_metadata(block)->size);
+}
+
+auto allocator_buddies_system::get_buddy(void* block, uint8_t rank, void* memory_start)
+{
+    auto offset = static_cast<size_t>(static_cast<char*>(block) - static_cast<char*>(memory_start));
+    size_t buddy_offset = offset ^ rank_to_size(rank);
+    return static_cast<void*>(static_cast<char*>(memory_start) + buddy_offset);
+}
+
+auto allocator_buddies_system::choose_rank(size_t size)
+{
+    if (size == 0)
     {
-        return reinterpret_cast<local_block_metadata*>(block);
+        return min_k;
     }
 
-    const local_block_metadata* get_block_metadata(const void* block) noexcept
+    auto rank = static_cast<uint8_t>(__detail::nearest_greater_k_of_2(size));
+    return rank < min_k ? min_k : rank;
+}
+
+void allocator_buddies_system::insert_free_block(void* block, uint8_t rank) const
+{
+    get_metadata(block)->occupied = false;
+    get_metadata(block)->size = rank;
+    *get_next_block(block) = get_head()[rank - min_k];
+    get_head()[rank - min_k] = block;
+}
+
+void allocator_buddies_system::remove_free_block(void* block, uint8_t rank) const
+{
+    void** head = get_head() + (rank - min_k);
+    void* current = *head;
+    void* previous = nullptr;
+
+    while (current != nullptr && current != block)
     {
-        return reinterpret_cast<const local_block_metadata*>(block);
+        previous = current;
+        current = *get_next_block(current);
     }
 
-    buddies_allocator_meta* get_meta(void* trusted) noexcept
+    if (current == nullptr)
     {
-        return reinterpret_cast<buddies_allocator_meta*>(trusted);
+        return;
     }
 
-    const buddies_allocator_meta* get_meta(const void* trusted) noexcept
+    void* next = *get_next_block(current);
+    if (previous == nullptr)
     {
-        return reinterpret_cast<const buddies_allocator_meta*>(trusted);
+        *head = next;
     }
-
-    unsigned char* region_begin(void* trusted) noexcept
+    else
     {
-        return reinterpret_cast<unsigned char*>(trusted) + sizeof(buddies_allocator_meta);
+        *get_next_block(previous) = next;
     }
+}
 
-    const unsigned char* region_begin(const void* trusted) noexcept
+auto allocator_buddies_system::find_suitable_block(uint8_t required_rank) const
+{
+    switch (*get_fit_mode())
     {
-        return reinterpret_cast<const unsigned char*>(trusted) + sizeof(buddies_allocator_meta);
-    }
-
-    size_t order_to_size(unsigned char order) noexcept
-    {
-        return static_cast<size_t>(1) << order;
-    }
-
-    void*& next_free_ref(void* block) noexcept
-    {
-        return *reinterpret_cast<void**>(reinterpret_cast<unsigned char*>(block) + sizeof(local_block_metadata));
-    }
-
-    void* const& next_free_ref(const void* block) noexcept
-    {
-        return *reinterpret_cast<void* const*>(reinterpret_cast<const unsigned char*>(block) + sizeof(local_block_metadata));
-    }
-
-    unsigned char required_order(size_t size) noexcept
-    {
-        return static_cast<unsigned char>(__detail::nearest_greater_k_of_2(size));
-    }
-
-    unsigned char normalize_order(size_t size) noexcept
-    {
-        if (size == 0)
-        {
-            return 0;
-        }
-        return static_cast<unsigned char>(__detail::nearest_greater_k_of_2(size));
-    }
-
-    void push_free_block(buddies_allocator_meta* meta, void* block, unsigned char order) noexcept
-    {
-        auto* header = get_block_metadata(block);
-        header->occupied = false;
-        header->size = order;
-        next_free_ref(block) = meta->free_heads[order];
-        meta->free_heads[order] = block;
-    }
-
-    void remove_free_block(buddies_allocator_meta* meta, void* block, unsigned char order) noexcept
-    {
-        void* previous = nullptr;
-        void* current = meta->free_heads[order];
-
-        while (current != nullptr && current != block)
-        {
-            previous = current;
-            current = next_free_ref(current);
-        }
-
-        if (current == nullptr)
-        {
-            return;
-        }
-
-        if (previous == nullptr)
-        {
-            meta->free_heads[order] = next_free_ref(current);
-        }
-        else
-        {
-            next_free_ref(previous) = next_free_ref(current);
-        }
-    }
-
-    void* clone_state(const void* source_trusted)
-    {
-        const auto* source_meta = get_meta(source_trusted);
-        auto* parent_allocator = source_meta->parent_allocator == nullptr
-            ? std::pmr::get_default_resource()
-            : source_meta->parent_allocator;
-
-        const auto total_size = sizeof(buddies_allocator_meta) + order_to_size(source_meta->max_order);
-        void* new_memory = parent_allocator->allocate(total_size, alignof(std::max_align_t));
-        std::memcpy(new_memory, source_trusted, total_size);
-
-        auto* new_meta = get_meta(new_memory);
-        new (&new_meta->mutex) std::mutex();
-        new_meta->parent_allocator = parent_allocator;
-
-        const auto offset = reinterpret_cast<unsigned char*>(new_memory)
-                            - reinterpret_cast<const unsigned char*>(source_trusted);
-
-        for (auto& head : new_meta->free_heads)
-        {
-            if (head != nullptr)
+        case fit_mode::first_fit:
+        case fit_mode::the_best_fit:
+            for (uint8_t rank = required_rank; rank <= *get_max_pow(); ++rank)
             {
-                head = reinterpret_cast<unsigned char*>(head) + offset;
-            }
-        }
-
-        auto* cursor = region_begin(new_memory);
-        const auto* end = region_begin(new_memory) + order_to_size(new_meta->max_order);
-        while (cursor < end)
-        {
-            auto* header = get_block_metadata(cursor);
-            if (!header->occupied)
-            {
-                auto& next = next_free_ref(cursor);
-                if (next != nullptr)
+                if (get_head()[rank - min_k] != nullptr)
                 {
-                    next = reinterpret_cast<unsigned char*>(next) + offset;
+                    return rank;
                 }
             }
-            cursor += order_to_size(header->size);
-        }
-
-        return new_memory;
+            break;
+        case fit_mode::the_worst_fit:
+            for (int rank = *get_max_pow(); rank >= required_rank; --rank)
+            {
+                if (get_head()[rank - min_k] != nullptr)
+                {
+                    return static_cast<uint8_t>(rank);
+                }
+            }
+            break;
     }
+
+    return static_cast<uint8_t>(0);
+}
+
+auto allocator_buddies_system::split_block(void* block, uint8_t current_rank, uint8_t target_rank) const
+{
+    remove_free_block(block, current_rank);
+
+    while (current_rank > target_rank)
+    {
+        --current_rank;
+        size_t half_size = rank_to_size(current_rank);
+        void* buddy = static_cast<char*>(block) + half_size;
+
+        get_metadata(block)->occupied = false;
+        get_metadata(block)->size = current_rank;
+        insert_free_block(buddy, current_rank);
+    }
+
+    return block;
 }
 
 allocator_buddies_system::~allocator_buddies_system()
@@ -173,224 +180,135 @@ allocator_buddies_system::~allocator_buddies_system()
         return;
     }
 
-    auto* meta = get_meta(_trusted_memory);
-    auto* parent_allocator = meta->parent_allocator == nullptr
-        ? std::pmr::get_default_resource()
-        : meta->parent_allocator;
-    const auto total_size = sizeof(buddies_allocator_meta) + order_to_size(meta->max_order);
+    auto* header = static_cast<allocator_buddies_header*>(_trusted_memory);
+    header->mutex.~mutex();
 
-    meta->mutex.~mutex();
-    parent_allocator->deallocate(_trusted_memory, total_size, alignof(std::max_align_t));
-    _trusted_memory = nullptr;
-}
-
-allocator_buddies_system::allocator_buddies_system(
-    allocator_buddies_system&& other) noexcept :
-    _trusted_memory(other._trusted_memory)
-{
-    other._trusted_memory = nullptr;
-}
-
-allocator_buddies_system& allocator_buddies_system::operator=(
-    allocator_buddies_system&& other) noexcept
-{
-    if (this == &other)
+    if (header->parent_alloc != nullptr)
     {
-        return *this;
+        header->parent_alloc->deallocate(_trusted_memory, get_reserved_size());
     }
-
-    this->~allocator_buddies_system();
-    _trusted_memory = other._trusted_memory;
-    other._trusted_memory = nullptr;
-    return *this;
+    else
+    {
+        ::operator delete(_trusted_memory);
+    }
 }
 
 allocator_buddies_system::allocator_buddies_system(
     size_t space_size,
     std::pmr::memory_resource* parent_allocator,
-    allocator_with_fit_mode::fit_mode allocate_fit_mode) :
-    _trusted_memory(nullptr)
+    allocator_with_fit_mode::fit_mode allocate_fit_mode)
+    : _trusted_memory(nullptr)
 {
-    const auto min_block_size = order_to_size(min_k);
-    if (space_size < min_block_size)
+    uint8_t max_k = choose_rank(space_size);
+    if (space_size < rank_to_size(min_k))
     {
-        throw std::logic_error("allocator_buddies_system: space size is too small");
+        throw std::logic_error("space size is too small");
     }
 
-    const auto max_order = normalize_order(space_size);
-    auto* real_parent_allocator = parent_allocator == nullptr
-        ? std::pmr::get_default_resource()
-        : parent_allocator;
+    auto free_lists_count = max_k - min_k + 1;
+    size_t reserved_size = sizeof(allocator_buddies_header) + free_lists_count * sizeof(void*) + rank_to_size(max_k);
 
-    const auto total_size = sizeof(buddies_allocator_meta) + order_to_size(max_order);
-    _trusted_memory = real_parent_allocator->allocate(total_size, alignof(std::max_align_t));
+    _trusted_memory = parent_allocator != nullptr
+        ? parent_allocator->allocate(reserved_size)
+        : ::operator new(reserved_size);
 
-    auto* meta = new (_trusted_memory) buddies_allocator_meta{
-        real_parent_allocator,
-        allocate_fit_mode,
-        max_order,
-        static_cast<unsigned char>(min_k),
-        std::mutex{},
-        {}
-    };
+    auto* header = static_cast<allocator_buddies_header*>(_trusted_memory);
+    header->parent_alloc = parent_allocator;
+    header->fit_mode = allocate_fit_mode;
+    header->max_pow = max_k;
+    new (&header->mutex) std::mutex();
 
-    auto* first_block = region_begin(_trusted_memory);
-    auto* header = get_block_metadata(first_block);
-    header->occupied = false;
-    header->size = max_order;
-    next_free_ref(first_block) = nullptr;
-    meta->free_heads[max_order] = first_block;
+    header->free_blocks = reinterpret_cast<void**>(static_cast<char*>(_trusted_memory) + sizeof(allocator_buddies_header));
+    header->mem_st = static_cast<char*>(static_cast<void*>(header->free_blocks + free_lists_count));
+
+    for (size_t i = 0; i < free_lists_count; ++i)
+    {
+        header->free_blocks[i] = nullptr;
+    }
+
+    void* initial_block = header->mem_st;
+    get_metadata(initial_block)->occupied = false;
+    get_metadata(initial_block)->size = max_k;
+    *get_next_block(initial_block) = nullptr;
+    header->free_blocks[max_k - min_k] = initial_block;
 }
 
-[[nodiscard]] void* allocator_buddies_system::do_allocate_sm(
-    size_t size)
+[[nodiscard]] void* allocator_buddies_system::do_allocate_sm(size_t size)
 {
-    std::lock_guard lock(get_meta(_trusted_memory)->mutex);
+    std::lock_guard lock(*get_mutex());
 
-    if (size == 0)
-    {
-        size = 1;
-    }
-
-    auto* meta = get_meta(_trusted_memory);
-    const auto needed_order = std::max(
-        meta->min_order,
-        required_order(sizeof(block_metadata) + sizeof(void*) + size));
-
-    void* block = nullptr;
-    unsigned char selected_order = 0;
-
-    if (meta->fit_mode == fit_mode::the_worst_fit)
-    {
-        for (int order = meta->max_order; order >= needed_order; --order)
-        {
-            if (meta->free_heads[order] != nullptr)
-            {
-                selected_order = static_cast<unsigned char>(order);
-                block = meta->free_heads[order];
-                break;
-            }
-        }
-    }
-    else
-    {
-        for (unsigned char order = needed_order; order <= meta->max_order; ++order)
-        {
-            if (meta->free_heads[order] != nullptr)
-            {
-                selected_order = order;
-                block = meta->free_heads[order];
-                break;
-            }
-            if (order == meta->max_order)
-            {
-                break;
-            }
-        }
-    }
-
-    if (block == nullptr)
+    uint8_t required_rank = choose_rank(size + occupied_block_metadata_size);
+    if (required_rank > *get_max_pow())
     {
         throw std::bad_alloc();
     }
 
-    remove_free_block(meta, block, selected_order);
-
-    while (selected_order > needed_order)
+    uint8_t selected_rank = find_suitable_block(required_rank);
+    if (selected_rank < required_rank)
     {
-        --selected_order;
-        const auto half_size = order_to_size(selected_order);
-        auto* right_buddy = reinterpret_cast<unsigned char*>(block) + half_size;
-        push_free_block(meta, right_buddy, selected_order);
-
-        auto* left_header = get_block_metadata(block);
-        left_header->occupied = false;
-        left_header->size = selected_order;
+        throw std::bad_alloc();
     }
 
-    auto* header = get_block_metadata(block);
-    header->occupied = true;
-    header->size = selected_order;
+    void* block = get_head()[selected_rank - min_k];
+    block = split_block(block, selected_rank, required_rank);
 
-    return reinterpret_cast<unsigned char*>(block) + sizeof(block_metadata) + sizeof(void*);
+    get_metadata(block)->occupied = true;
+    get_metadata(block)->size = required_rank;
+    *get_next_block(block) = nullptr;
+
+    return static_cast<char*>(block) + occupied_block_metadata_size;
 }
 
 void allocator_buddies_system::do_deallocate_sm(void* at)
 {
+    std::lock_guard lock(*get_mutex());
+
     if (at == nullptr)
     {
         return;
     }
 
-    auto* meta = get_meta(_trusted_memory);
-    std::lock_guard lock(meta->mutex);
+    char* memory_start = get_memory_start();
+    char* memory_end = get_memory_end();
+    char* block = static_cast<char*>(at) - occupied_block_metadata_size;
 
-    auto* block = reinterpret_cast<unsigned char*>(at) - (sizeof(block_metadata) + sizeof(void*));
-    if (block < region_begin(_trusted_memory)
-        || block >= region_begin(_trusted_memory) + order_to_size(meta->max_order))
+    if (block < memory_start || block >= memory_end)
     {
-        return;
+        throw std::invalid_argument("block bounds are invalid");
     }
 
-    auto* header = get_block_metadata(block);
-    if (!header->occupied)
+    auto* metadata = get_metadata(block);
+    if (!metadata->occupied)
     {
-        return;
+        throw std::invalid_argument("block is already free");
     }
 
-    auto order = header->size;
-    header->occupied = false;
+    uint8_t rank = metadata->size;
+    metadata->occupied = false;
 
-    auto* base = region_begin(_trusted_memory);
-    while (order < meta->max_order)
+    while (rank < *get_max_pow())
     {
-        const auto block_size = order_to_size(order);
-        const auto offset = static_cast<size_t>(block - base);
-        auto* buddy = base + (offset ^ block_size);
-
-        if (buddy < base || buddy >= base + order_to_size(meta->max_order))
+        void* buddy = get_buddy(block, rank, memory_start);
+        if (buddy < memory_start || buddy >= memory_end)
         {
             break;
         }
 
-        auto* buddy_header = get_block_metadata(buddy);
-        if (buddy_header->occupied || buddy_header->size != order)
+        auto* buddy_metadata = get_metadata(buddy);
+        if (buddy_metadata->occupied || buddy_metadata->size != rank)
         {
             break;
         }
 
-        remove_free_block(meta, buddy, order);
-        block = std::min(block, buddy);
-        ++order;
-        auto* merged_header = get_block_metadata(block);
-        merged_header->occupied = false;
-        merged_header->size = order;
+        remove_free_block(buddy, rank);
+        block = static_cast<char*>(buddy < block ? buddy : block);
+        ++rank;
+        metadata = get_metadata(block);
+        metadata->occupied = false;
+        metadata->size = rank;
     }
 
-    push_free_block(meta, block, order);
-}
-
-allocator_buddies_system::allocator_buddies_system(const allocator_buddies_system& other) :
-    _trusted_memory(nullptr)
-{
-    std::lock_guard lock(get_meta(other._trusted_memory)->mutex);
-    _trusted_memory = clone_state(other._trusted_memory);
-}
-
-allocator_buddies_system& allocator_buddies_system::operator=(const allocator_buddies_system& other)
-{
-    if (this == &other)
-    {
-        return *this;
-    }
-
-    auto* other_meta = get_meta(other._trusted_memory);
-    std::lock_guard lock(other_meta->mutex);
-    void* cloned = clone_state(other._trusted_memory);
-
-    this->~allocator_buddies_system();
-    _trusted_memory = cloned;
-    return *this;
+    insert_free_block(block, rank);
 }
 
 bool allocator_buddies_system::do_is_equal(const std::pmr::memory_resource& other) const noexcept
@@ -400,46 +318,47 @@ bool allocator_buddies_system::do_is_equal(const std::pmr::memory_resource& othe
         return true;
     }
 
-    auto* other_ptr = dynamic_cast<const allocator_buddies_system*>(&other);
-    return other_ptr != nullptr && other_ptr == this;
+    auto* rhs = dynamic_cast<const allocator_buddies_system*>(&other);
+    return rhs != nullptr && _trusted_memory == rhs->_trusted_memory;
 }
 
-inline void allocator_buddies_system::set_fit_mode(
-    allocator_with_fit_mode::fit_mode mode)
+inline void allocator_buddies_system::set_fit_mode(allocator_with_fit_mode::fit_mode mode)
 {
-    std::lock_guard lock(get_meta(_trusted_memory)->mutex);
-    get_meta(_trusted_memory)->fit_mode = mode;
+    std::lock_guard lock(*get_mutex());
+    *get_fit_mode() = mode;
 }
 
 std::vector<allocator_test_utils::block_info> allocator_buddies_system::get_blocks_info() const noexcept
 {
-    std::lock_guard lock(get_meta(_trusted_memory)->mutex);
+    std::lock_guard lock(*get_mutex());
     return get_blocks_info_inner();
 }
 
 std::vector<allocator_test_utils::block_info> allocator_buddies_system::get_blocks_info_inner() const
 {
-    std::vector<allocator_test_utils::block_info> result;
+    std::vector<block_info> result;
+
     for (auto it = begin(); it != end(); ++it)
     {
         result.push_back({it.size(), it.occupied()});
     }
+
     return result;
 }
 
 allocator_buddies_system::buddy_iterator allocator_buddies_system::begin() const noexcept
 {
-    return buddy_iterator(region_begin(_trusted_memory));
+    return {get_memory_start(), get_memory_end()};
 }
 
 allocator_buddies_system::buddy_iterator allocator_buddies_system::end() const noexcept
 {
-    return buddy_iterator(region_begin(_trusted_memory) + order_to_size(get_meta(_trusted_memory)->max_order));
+    return {get_memory_end(), get_memory_end()};
 }
 
 bool allocator_buddies_system::buddy_iterator::operator==(const allocator_buddies_system::buddy_iterator& other) const noexcept
 {
-    return _block == other._block;
+    return _block == other._block && _end == other._end;
 }
 
 bool allocator_buddies_system::buddy_iterator::operator!=(const allocator_buddies_system::buddy_iterator& other) const noexcept
@@ -449,11 +368,17 @@ bool allocator_buddies_system::buddy_iterator::operator!=(const allocator_buddie
 
 allocator_buddies_system::buddy_iterator& allocator_buddies_system::buddy_iterator::operator++() & noexcept
 {
-    if (_block != nullptr)
+    if (_block == nullptr || _block == _end)
     {
-        auto* header = get_block_metadata(_block);
-        _block = reinterpret_cast<unsigned char*>(_block) + order_to_size(header->size);
+        return *this;
     }
+
+    _block = static_cast<char*>(_block) + get_block_size(_block);
+    if (_block >= _end)
+    {
+        _block = _end;
+    }
+
     return *this;
 }
 
@@ -466,27 +391,27 @@ allocator_buddies_system::buddy_iterator allocator_buddies_system::buddy_iterato
 
 size_t allocator_buddies_system::buddy_iterator::size() const noexcept
 {
-    return _block == nullptr ? 0 : order_to_size(get_block_metadata(_block)->size);
+    return _block == nullptr || _block == _end ? 0 : get_block_size(_block);
 }
 
 bool allocator_buddies_system::buddy_iterator::occupied() const noexcept
 {
-    return _block != nullptr && get_block_metadata(_block)->occupied;
+    return _block != nullptr && _block != _end && get_metadata(_block)->occupied;
 }
 
 void* allocator_buddies_system::buddy_iterator::operator*() const noexcept
 {
-    return _block == nullptr
+    return _block == nullptr || _block == _end
         ? nullptr
-        : reinterpret_cast<unsigned char*>(_block) + sizeof(block_metadata) + sizeof(void*);
+        : static_cast<char*>(_block) + occupied_block_metadata_size;
 }
 
-allocator_buddies_system::buddy_iterator::buddy_iterator(void* start) :
-    _block(start)
+allocator_buddies_system::buddy_iterator::buddy_iterator(void* start, void* end)
+    : _block(start), _end(end)
 {
 }
 
-allocator_buddies_system::buddy_iterator::buddy_iterator() :
-    _block(nullptr)
+allocator_buddies_system::buddy_iterator::buddy_iterator()
+    : _block(nullptr), _end(nullptr)
 {
 }
