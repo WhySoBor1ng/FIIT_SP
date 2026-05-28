@@ -41,24 +41,24 @@ auto allocator_boundary_tags::get_memory_end() const
     return static_cast<char*>(_trusted_memory) + *get_full_size();
 }
 
-auto allocator_boundary_tags::get_free_prev_block(void* block)
+auto allocator_boundary_tags::get_prev_block(void* block)
 {
     return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(size_t));
 }
 
-auto allocator_boundary_tags::get_free_next_block(void* block)
+auto allocator_boundary_tags::get_next_block(void* block)
 {
     return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(size_t) + sizeof(void*));
-}
-
-auto allocator_boundary_tags::get_prev_block(void* block)
-{
-    return reinterpret_cast<void**>(static_cast<char*>(block) + sizeof(size_t) + 2 * sizeof(void*));
 }
 
 auto allocator_boundary_tags::set_prev_block(void* block, void* prev_block)
 {
     *get_prev_block(block) = prev_block;
+}
+
+auto allocator_boundary_tags::set_next_block(void* block, void* next_block)
+{
+    *get_next_block(block) = next_block;
 }
 
 auto allocator_boundary_tags::get_size_block_ptr(void* block)
@@ -71,19 +71,10 @@ auto allocator_boundary_tags::get_size_block(void* block)
     return *get_size_block_ptr(block) & ~size_t(1);
 }
 
-void allocator_boundary_tags::insert_free_block(void* block) const
+void allocator_boundary_tags::insert_occupied_block(void* block, void* prev, void* next) const
 {
-    void* prev = nullptr;
-    void* current = *get_head();
-
-    while (current != nullptr && current < block)
-    {
-        prev = current;
-        current = *get_free_next_block(current);
-    }
-
-    *get_free_prev_block(block) = prev;
-    *get_free_next_block(block) = current;
+    set_prev_block(block, prev);
+    set_next_block(block, next);
 
     if (prev == nullptr)
     {
@@ -91,19 +82,19 @@ void allocator_boundary_tags::insert_free_block(void* block) const
     }
     else
     {
-        *get_free_next_block(prev) = block;
+        set_next_block(prev, block);
     }
 
-    if (current != nullptr)
+    if (next != nullptr)
     {
-        *get_free_prev_block(current) = block;
+        set_prev_block(next, block);
     }
 }
 
-void allocator_boundary_tags::remove_free_block(void* block) const
+void allocator_boundary_tags::remove_occupied_block(void* block) const
 {
-    void* prev = *get_free_prev_block(block);
-    void* next = *get_free_next_block(block);
+    void* prev = *get_prev_block(block);
+    void* next = *get_next_block(block);
 
     if (prev == nullptr)
     {
@@ -111,50 +102,81 @@ void allocator_boundary_tags::remove_free_block(void* block) const
     }
     else
     {
-        *get_free_next_block(prev) = next;
+        set_next_block(prev, next);
     }
 
     if (next != nullptr)
     {
-        *get_free_prev_block(next) = prev;
+        set_prev_block(next, prev);
     }
 }
 
-allocator_boundary_tags::block_choice allocator_boundary_tags::find_block(size_t needed) const
+allocator_boundary_tags::occupied_block allocator_boundary_tags::find_block(size_t needed) const
 {
-    block_choice choice{nullptr, 0};
+    occupied_block choice{nullptr, nullptr, nullptr, 0};
 
-    for (void* block = *get_head(); block != nullptr; block = *get_free_next_block(block))
+    void* previous = nullptr;
+    void* current = *get_head();
+    char* gap_start = get_memory_start();
+
+    while (true)
     {
-        size_t block_size = get_size_block(block);
-        if (block_size < needed)
+        char* gap_end = current == nullptr
+            ? get_memory_end()
+            : static_cast<char*>(current);
+        size_t gap_size = static_cast<size_t>(gap_end - gap_start);
+
+        if (gap_size >= needed)
         {
-            continue;
+            if (*get_fit_mode() == fit_mode::first_fit)
+            {
+                return {gap_start, previous, current, gap_size};
+            }
+
+            if (choice.block == nullptr
+                || (*get_fit_mode() == fit_mode::the_best_fit && gap_size < choice.size)
+                || (*get_fit_mode() == fit_mode::the_worst_fit && gap_size > choice.size))
+            {
+                choice = {gap_start, previous, current, gap_size};
+            }
         }
 
-        if (*get_fit_mode() == fit_mode::first_fit)
+        if (current == nullptr)
         {
-            return {block, block_size};
+            break;
         }
 
-        if (choice.block == nullptr)
-        {
-            choice = {block, block_size};
-            continue;
-        }
-
-        if (*get_fit_mode() == fit_mode::the_best_fit && block_size < choice.size)
-        {
-            choice = {block, block_size};
-        }
-
-        if (*get_fit_mode() == fit_mode::the_worst_fit && block_size > choice.size)
-        {
-            choice = {block, block_size};
-        }
+        previous = current;
+        gap_start = static_cast<char*>(current) + get_size_block(current);
+        current = *get_next_block(current);
     }
 
     return choice;
+}
+
+void* allocator_boundary_tags::find_next_occupied_block(void* block) const
+{
+    for (void* current = *get_head(); current != nullptr; current = *get_next_block(current))
+    {
+        if (current > block)
+        {
+            return current;
+        }
+    }
+
+    return nullptr;
+}
+
+void* allocator_boundary_tags::find_prev_occupied_block(void* block) const
+{
+    void* previous = nullptr;
+
+    for (void* current = *get_head(); current != nullptr && current < block; current = *get_next_block(current))
+    {
+        previous = current;
+    }
+
+    return previous;
 }
 
 bool allocator_boundary_tags::is_block_free(void* block)
@@ -189,13 +211,7 @@ allocator_boundary_tags::allocator_boundary_tags(
     *get_fit_mode() = allocate_fit_mode;
     *get_full_size() = total_size;
     new (get_mutex()) std::mutex();
-
-    void* first_block = get_memory_start();
-    *get_head() = first_block;
-    *get_free_prev_block(first_block) = nullptr;
-    *get_free_next_block(first_block) = nullptr;
-    *get_prev_block(first_block) = nullptr;
-    *get_size_block_ptr(first_block) = space_size;
+    *get_head() = nullptr;
 }
 
 [[nodiscard]] void* allocator_boundary_tags::do_allocate_sm(size_t size)
@@ -203,40 +219,20 @@ allocator_boundary_tags::allocator_boundary_tags(
     std::lock_guard lock(*get_mutex());
 
     size_t needed = size + occupied_block_metadata_size;
-    block_choice choice = find_block(needed);
+    occupied_block choice = find_block(needed);
     if (choice.block == nullptr)
     {
         throw std::bad_alloc();
     }
 
-    void* prev_block = *get_prev_block(choice.block);
-    remove_free_block(choice.block);
-
-    size_t remainder = choice.size - needed;
-    if (remainder >= occupied_block_metadata_size)
+    size_t occupied_size = needed;
+    if (choice.size - needed < occupied_block_metadata_size)
     {
-        void* free_block = static_cast<char*>(choice.block) + needed;
-        *get_size_block_ptr(choice.block) = needed | size_t(1);
-        set_prev_block(choice.block, prev_block);
-
-        *get_size_block_ptr(free_block) = remainder;
-        *get_free_prev_block(free_block) = nullptr;
-        *get_free_next_block(free_block) = nullptr;
-        set_prev_block(free_block, choice.block);
-
-        void* next_block = static_cast<char*>(free_block) + remainder;
-        if (next_block < get_memory_end())
-        {
-            set_prev_block(next_block, free_block);
-        }
-
-        insert_free_block(free_block);
+        occupied_size = choice.size;
     }
-    else
-    {
-        *get_size_block_ptr(choice.block) = choice.size | size_t(1);
-        set_prev_block(choice.block, prev_block);
-    }
+
+    *get_size_block_ptr(choice.block) = occupied_size | size_t(1);
+    insert_occupied_block(choice.block, choice.prev, choice.next);
 
     return static_cast<char*>(choice.block) + occupied_block_metadata_size;
 }
@@ -256,29 +252,19 @@ void allocator_boundary_tags::do_deallocate_sm(void* at)
     }
 
     void* block = static_cast<char*>(at) - occupied_block_metadata_size;
-    *get_size_block_ptr(block) = get_size_block(block);
+    void* current = *get_head();
 
-    if (void* prev = *get_prev_block(block); prev != nullptr && is_block_free(prev))
+    while (current != nullptr && current != block)
     {
-        remove_free_block(prev);
-        *get_size_block_ptr(prev) = get_size_block(prev) + get_size_block(block);
-        block = prev;
+        current = *get_next_block(current);
     }
 
-    void* next = static_cast<char*>(block) + get_size_block(block);
-    if (next < get_memory_end() && is_block_free(next))
+    if (current == nullptr)
     {
-        remove_free_block(next);
-        *get_size_block_ptr(block) = get_size_block(block) + get_size_block(next);
+        throw std::invalid_argument("block is free");
     }
 
-    next = static_cast<char*>(block) + get_size_block(block);
-    if (next < get_memory_end())
-    {
-        set_prev_block(next, block);
-    }
-
-    insert_free_block(block);
+    remove_occupied_block(block);
 }
 
 inline void allocator_boundary_tags::set_fit_mode(allocator_with_fit_mode::fit_mode mode)
@@ -297,9 +283,22 @@ std::vector<allocator_test_utils::block_info> allocator_boundary_tags::get_block
 {
     std::vector<block_info> result;
 
-    for (char* block = get_memory_start(); block < get_memory_end(); block += get_size_block(block))
+    char* current = get_memory_start();
+    for (void* occupied = *get_head(); occupied != nullptr; occupied = *get_next_block(occupied))
     {
-        result.push_back({get_size_block(block), !is_block_free(block)});
+        if (current < occupied)
+        {
+            result.push_back({static_cast<size_t>(static_cast<char*>(occupied) - current), false});
+        }
+
+        size_t occupied_size = get_size_block(occupied);
+        result.push_back({occupied_size, true});
+        current = static_cast<char*>(occupied) + occupied_size;
+    }
+
+    if (current < get_memory_end())
+    {
+        result.push_back({static_cast<size_t>(get_memory_end() - current), false});
     }
 
     return result;
@@ -328,7 +327,7 @@ bool allocator_boundary_tags::do_is_equal(const std::pmr::memory_resource& other
 
 bool allocator_boundary_tags::boundary_iterator::operator==(const allocator_boundary_tags::boundary_iterator& other) const noexcept
 {
-    return _occupied_ptr == other._occupied_ptr && _trusted_memory == other._trusted_memory;
+    return _occupied_ptr == other._occupied_ptr && _occupied == other._occupied && _trusted_memory == other._trusted_memory;
 }
 
 bool allocator_boundary_tags::boundary_iterator::operator!=(const allocator_boundary_tags::boundary_iterator& other) const noexcept
@@ -344,35 +343,112 @@ allocator_boundary_tags::boundary_iterator& allocator_boundary_tags::boundary_it
     }
 
     auto* allocator = static_cast<allocator_boundary_tags*>(_trusted_memory);
-    _occupied_ptr = static_cast<char*>(_occupied_ptr) + allocator_boundary_tags::get_size_block(_occupied_ptr);
-    if (_occupied_ptr >= allocator->get_memory_end())
+    if (_occupied)
     {
-        _occupied_ptr = nullptr;
-        _occupied = false;
-    }
-    else
-    {
-        _occupied = !allocator_boundary_tags::is_block_free(_occupied_ptr);
+        void* next_occupied = *allocator_boundary_tags::get_next_block(_occupied_ptr);
+        char* next_block = static_cast<char*>(_occupied_ptr) + allocator_boundary_tags::get_size_block(_occupied_ptr);
+
+        if (next_occupied != nullptr)
+        {
+            if (next_block < next_occupied)
+            {
+                _occupied_ptr = next_block;
+                _occupied = false;
+            }
+            else
+            {
+                _occupied_ptr = next_occupied;
+                _occupied = true;
+            }
+            return *this;
+        }
+
+        if (next_block < allocator->get_memory_end())
+        {
+            _occupied_ptr = next_block;
+            _occupied = false;
+        }
+        else
+        {
+            _occupied_ptr = nullptr;
+            _occupied = false;
+        }
+
+        return *this;
     }
 
+    void* next_occupied = allocator->find_next_occupied_block(_occupied_ptr);
+    _occupied_ptr = next_occupied;
+    _occupied = next_occupied != nullptr;
     return *this;
 }
 
 allocator_boundary_tags::boundary_iterator& allocator_boundary_tags::boundary_iterator::operator--() & noexcept
 {
-    if (_occupied_ptr == nullptr || _trusted_memory == nullptr)
+    if (_trusted_memory == nullptr)
     {
         return *this;
     }
 
     auto* allocator = static_cast<allocator_boundary_tags*>(_trusted_memory);
-    void* prev = *allocator_boundary_tags::get_prev_block(_occupied_ptr);
-    if (prev != nullptr && prev >= allocator->get_memory_start())
+
+    if (_occupied_ptr == nullptr)
     {
-        _occupied_ptr = prev;
-        _occupied = !allocator_boundary_tags::is_block_free(_occupied_ptr);
+        void* last_occupied = allocator->find_prev_occupied_block(allocator->get_memory_end());
+        if (last_occupied == nullptr)
+        {
+            if (allocator->get_memory_start() < allocator->get_memory_end())
+            {
+                _occupied_ptr = allocator->get_memory_start();
+                _occupied = false;
+            }
+            return *this;
+        }
+
+        char* after_last = static_cast<char*>(last_occupied) + allocator_boundary_tags::get_size_block(last_occupied);
+        if (after_last < allocator->get_memory_end())
+        {
+            _occupied_ptr = after_last;
+            _occupied = false;
+        }
+        else
+        {
+            _occupied_ptr = last_occupied;
+            _occupied = true;
+        }
+        return *this;
     }
 
+    if (_occupied)
+    {
+        void* prev_occupied = *allocator_boundary_tags::get_prev_block(_occupied_ptr);
+        if (prev_occupied == nullptr)
+        {
+            if (_occupied_ptr > allocator->get_memory_start())
+            {
+                _occupied_ptr = allocator->get_memory_start();
+                _occupied = false;
+            }
+            return *this;
+        }
+
+        char* gap_start = static_cast<char*>(prev_occupied) + allocator_boundary_tags::get_size_block(prev_occupied);
+        if (gap_start < _occupied_ptr)
+        {
+            _occupied_ptr = gap_start;
+            _occupied = false;
+        }
+        else
+        {
+            _occupied_ptr = prev_occupied;
+            _occupied = true;
+        }
+        return *this;
+    }
+
+    void* prev_occupied = allocator->find_prev_occupied_block(_occupied_ptr);
+    _occupied_ptr = prev_occupied;
+    _occupied = prev_occupied != nullptr;
     return *this;
 }
 
@@ -392,7 +468,22 @@ allocator_boundary_tags::boundary_iterator allocator_boundary_tags::boundary_ite
 
 size_t allocator_boundary_tags::boundary_iterator::size() const noexcept
 {
-    return _occupied_ptr == nullptr ? 0 : allocator_boundary_tags::get_size_block(_occupied_ptr);
+    if (_occupied_ptr == nullptr || _trusted_memory == nullptr)
+    {
+        return 0;
+    }
+
+    auto* allocator = static_cast<allocator_boundary_tags*>(_trusted_memory);
+    if (_occupied)
+    {
+        return allocator_boundary_tags::get_size_block(_occupied_ptr);
+    }
+
+    void* next_occupied = allocator->find_next_occupied_block(_occupied_ptr);
+    char* gap_end = next_occupied == nullptr
+        ? allocator->get_memory_end()
+        : static_cast<char*>(next_occupied);
+    return static_cast<size_t>(gap_end - static_cast<char*>(_occupied_ptr));
 }
 
 bool allocator_boundary_tags::boundary_iterator::occupied() const noexcept
@@ -419,10 +510,21 @@ allocator_boundary_tags::boundary_iterator::boundary_iterator(void* trusted)
     }
 
     auto* allocator = static_cast<allocator_boundary_tags*>(_trusted_memory);
-    if (allocator->get_memory_start() < allocator->get_memory_end())
+    if (allocator->get_memory_start() >= allocator->get_memory_end())
+    {
+        return;
+    }
+
+    void* first_occupied = *allocator->get_head();
+    if (first_occupied == nullptr || first_occupied > allocator->get_memory_start())
     {
         _occupied_ptr = allocator->get_memory_start();
-        _occupied = !allocator_boundary_tags::is_block_free(_occupied_ptr);
+        _occupied = false;
+    }
+    else
+    {
+        _occupied_ptr = first_occupied;
+        _occupied = true;
     }
 }
 

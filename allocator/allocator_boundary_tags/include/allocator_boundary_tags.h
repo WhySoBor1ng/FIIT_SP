@@ -15,9 +15,11 @@ class allocator_boundary_tags final :
 
 private:
 
-    struct block_choice
+    struct occupied_block
     {
         void* block;
+        void* prev;
+        void* next;
         size_t size;
     };
 
@@ -25,8 +27,6 @@ private:
                                                             sizeof(size_t) + sizeof(std::mutex) + sizeof(void*);
 
     static constexpr const size_t occupied_block_metadata_size = sizeof(size_t) + sizeof(void*) + sizeof(void*) + sizeof(void*);
-
-    static constexpr const size_t free_block_metadata_size = 0;
 
     void *_trusted_memory;
 
@@ -78,18 +78,19 @@ private:
     [[nodiscard]] auto get_memory_start() const;
     [[nodiscard]] auto get_memory_end() const;
 
-    static auto get_free_prev_block(void* block);
-    static auto get_free_next_block(void* block);
-
     static auto get_prev_block(void* block);
+    static auto get_next_block(void* block);
     static auto set_prev_block(void* block, void* next_block);
+    static auto set_next_block(void* block, void* next_block);
 
     static auto get_size_block_ptr(void* block);
     static auto get_size_block(void* block);
 
-    void insert_free_block(void* block) const;
-    void remove_free_block(void* block) const;
-    [[nodiscard]] block_choice find_block(size_t needed) const;
+    void insert_occupied_block(void* block, void* prev, void* next) const;
+    void remove_occupied_block(void* block) const;
+    [[nodiscard]] occupied_block find_block(size_t needed) const;
+    [[nodiscard]] void* find_next_occupied_block(void* block) const;
+    [[nodiscard]] void* find_prev_occupied_block(void* block) const;
 
     static bool is_block_free(void* block);
 private:
